@@ -1,0 +1,13 @@
+# 构建产物与 GPU 编译缓存
+bin/
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 编辑器/系统
+*.user
+.DS_Store
+Thumbs.db
