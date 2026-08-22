@@ -7,6 +7,9 @@ __pycache__/
 *.pyc
 .venv/
 
+# 基准测试生成的大字典(由 tests/bench.py 按需生成)
+tests/wl-bench*.txt
+
 # 编辑器/系统
 *.user
 .DS_Store

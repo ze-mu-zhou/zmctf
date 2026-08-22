@@ -189,6 +189,166 @@ inline void sha1Iv(uint32_t h[5]) {
   h[0] = 0x67452301; h[1] = 0xEFCDAB89; h[2] = 0x98BADCFE; h[3] = 0x10325476; h[4] = 0xC3D2E1F0;
 }
 
+/**
+ * SHA-NI 块压缩(字域版):输入已是主机序持有的大端字(免逐块 bswap shuffle)。
+ * 爆破热路径专用——尾块/填充块预转字域后,逐候选只剩纯压缩。
+ * 与 sha1niBlocks 轮次一致,仅消息装载不同。
+ */
+__attribute__((target("sha,sse4.1")))
+inline void sha1niBlocksW(uint32_t state[5], const uint32_t* w, size_t blocks) {
+  // sha1niBlocks 的 MASK(16 字节全反转)把 BE 字节流变成"反字序的本机字";
+  // 字数组本来就是本机字,故这里只需反字序(shuffle_epi32 0x1B),免 bswap
+  __m128i ABCD = _mm_loadu_si128((const __m128i*)state);
+  __m128i E0 = _mm_set_epi32((int)state[4], 0, 0, 0);
+  ABCD = _mm_shuffle_epi32(ABCD, 0x1B);
+  while (blocks--) {
+    const __m128i ABCD_SAVE = ABCD;
+    const __m128i E0_SAVE = E0;
+    __m128i E1, MSG0, MSG1, MSG2, MSG3;
+
+    // 轮 0-3(k=0)
+    MSG0 = _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(w + 0)), 0x1B);
+    E0 = _mm_add_epi32(E0, MSG0);
+    E1 = ABCD;
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+    // 轮 4-7
+    MSG1 = _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(w + 4)), 0x1B);
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0);
+    MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+    // 轮 8-11
+    MSG2 = _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(w + 8)), 0x1B);
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+    MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+    // 轮 12-15
+    MSG3 = _mm_shuffle_epi32(_mm_loadu_si128((const __m128i*)(w + 12)), 0x1B);
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 0);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+    MSG1 = _mm_xor_si128(MSG1, MSG3);
+    // 轮 16-19
+    E0 = _mm_sha1nexte_epu32(E0, MSG0);
+    E1 = ABCD;
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 0);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+    MSG2 = _mm_xor_si128(MSG2, MSG0);
+    // 轮 20-23(k=1)
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+    MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+    MSG3 = _mm_xor_si128(MSG3, MSG1);
+    // 轮 24-27
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 1);
+    MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+    // 轮 28-31
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+    MSG1 = _mm_xor_si128(MSG1, MSG3);
+    // 轮 32-35
+    E0 = _mm_sha1nexte_epu32(E0, MSG0);
+    E1 = ABCD;
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 1);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+    MSG2 = _mm_xor_si128(MSG2, MSG0);
+    // 轮 36-39
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 1);
+    MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+    MSG3 = _mm_xor_si128(MSG3, MSG1);
+    // 轮 40-43(k=2)
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+    MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+    // 轮 44-47
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 2);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+    MSG1 = _mm_xor_si128(MSG1, MSG3);
+    // 轮 48-51
+    E0 = _mm_sha1nexte_epu32(E0, MSG0);
+    E1 = ABCD;
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+    MSG2 = _mm_xor_si128(MSG2, MSG0);
+    // 轮 52-55
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 2);
+    MSG0 = _mm_sha1msg1_epu32(MSG0, MSG1);
+    MSG3 = _mm_xor_si128(MSG3, MSG1);
+    // 轮 56-59
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 2);
+    MSG1 = _mm_sha1msg1_epu32(MSG1, MSG2);
+    MSG0 = _mm_xor_si128(MSG0, MSG2);
+    // 轮 60-63(k=3)
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    MSG0 = _mm_sha1msg2_epu32(MSG0, MSG3);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+    MSG2 = _mm_sha1msg1_epu32(MSG2, MSG3);
+    MSG1 = _mm_xor_si128(MSG1, MSG3);
+    // 轮 64-67
+    E0 = _mm_sha1nexte_epu32(E0, MSG0);
+    E1 = ABCD;
+    MSG1 = _mm_sha1msg2_epu32(MSG1, MSG0);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
+    MSG3 = _mm_sha1msg1_epu32(MSG3, MSG0);
+    MSG2 = _mm_xor_si128(MSG2, MSG0);
+    // 轮 68-71
+    E1 = _mm_sha1nexte_epu32(E1, MSG1);
+    E0 = ABCD;
+    MSG2 = _mm_sha1msg2_epu32(MSG2, MSG1);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+    MSG3 = _mm_xor_si128(MSG3, MSG1);
+    // 轮 72-75
+    E0 = _mm_sha1nexte_epu32(E0, MSG2);
+    E1 = ABCD;
+    MSG3 = _mm_sha1msg2_epu32(MSG3, MSG2);
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E0, 3);
+    // 轮 76-79
+    E1 = _mm_sha1nexte_epu32(E1, MSG3);
+    E0 = ABCD;
+    ABCD = _mm_sha1rnds4_epu32(ABCD, E1, 3);
+
+    // 回加上一状态
+    E0 = _mm_sha1nexte_epu32(E0, E0_SAVE);
+    ABCD = _mm_add_epi32(ABCD, ABCD_SAVE);
+    w += 16;
+  }
+  ABCD = _mm_shuffle_epi32(ABCD, 0x1B);
+  _mm_storeu_si128((__m128i*)state, ABCD);
+  state[4] = (uint32_t)_mm_extract_epi32(E0, 3);
+}
+
 /** 状态 → 20 字节大端摘要 */
 inline void sha1StoreBe20(const uint32_t h[5], uint8_t out[20]) {
   for (int i = 0; i < 5; i++) {

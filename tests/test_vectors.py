@@ -1,4 +1,4 @@
-"""zemu-crypto 对拍测试:用真 itsdangerous/Flask 出 cookie,校验 CLI 各命令。
+"""zemu-flask 对拍测试:用真 itsdangerous/Flask 出 cookie,校验 CLI 各命令。
 
 用法(需先 pip install itsdangerous flask 到虚拟环境):
     python tests/test_vectors.py
@@ -17,7 +17,7 @@ from itsdangerous import URLSafeTimedSerializer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-TOOL = os.path.join(ROOT, "bin", "zemu-crypto.exe")
+TOOL = os.path.join(ROOT, "bin", "zemu-flask.exe")
 WORDLIST = os.path.join(HERE, "wl-test.txt")
 
 
@@ -99,6 +99,14 @@ check("sign-dupkey", ser.loads(r.stdout.strip()) == {"a": 2})
 r = run("flask", "sign", "--secret", "s", "--json", "[" * 300 + "1" + "]" * 300)
 check("sign-deep-nest", r.returncode == 1)
 
+# --- 5b. sign 健壮性:截断 \u 转义(防 hex4 越界读)与非法 UTF-8(jsonEscape 强校验)---
+r = run("flask", "sign", "--secret", "s", "--json", '{"x":"\\u12')
+check("sign-trunc-u", r.returncode == 1)
+# 非法 UTF-8 字节(0xFF)经 serve 模式按原始字节喂入,须拒绝签名(rc=1)
+payload = b'["flask", "sign", "--secret", "s", "--json", "{\\"x\\":\\"\xff\\"}"]\n'
+r = subprocess.run([TOOL, "serve"], input=payload, capture_output=True)
+check("sign-bad-utf8", b"<<<zk-rc=1>>>" in r.stdout)
+
 # --- 6. crack 字典:CPU 与 GPU 双引擎 ---
 cookie = make_serializer("dragon").dumps({"flag": "ctf{demo}"})
 with open(WORDLIST, "w", encoding="utf-8") as f:
@@ -108,6 +116,21 @@ for engine in ("cpu", "gpu", "auto"):
             "--threads", "4", "--engine", engine)
     check(f"crack-dict-{engine}", r.returncode == 0 and r.stdout.strip() == "dragon",
           r.stderr.strip().splitlines()[-1] if r.stderr else "")
+os.unlink(WORDLIST)
+
+# --- 6b. hybrid 字典含超长词:GPU 命中后不得再过 idxMap(回归:曾双重映射输出错误词) ---
+cookie = make_serializer("target123").dumps({"x": 1})
+with open(WORDLIST, "w", encoding="utf-8") as f:
+    f.write("a" * 40 + "\n")        # 超 stride=32,GPU 打包跳过 → idxMap 非恒等
+    f.write("target123\n")          # 原下标 1;GPU 命中 packed 0,映回原下标 1
+    for i in range(2_000_000):      # 填充词拖住 CPU 侧(单线程从尾部降序吃块),让 GPU 先命中
+        f.write(f"zz{i:07x}\n")
+env = dict(os.environ, ZK_GPUTHRESH="1", ZK_NOPROG="1")  # 强制小字典也走 GPU+CPU 混合
+r = subprocess.run([TOOL, "flask", "crack", "--cookie", cookie, "--wordlist", WORDLIST,
+                    "--engine", "auto", "--threads", "1"],
+                   capture_output=True, text=True, encoding="utf-8", env=env)
+check("crack-dict-hybrid-skip", r.returncode == 0 and r.stdout.strip() == "target123",
+      f"{r.stdout.strip()[:40]} | {r.stderr.strip().splitlines()[-1] if r.stderr else ''}")
 os.unlink(WORDLIST)
 
 # --- 7. crack 掩码:CPU 与 GPU 双引擎(密钥 ab12 → ?l?l?d?d) ---

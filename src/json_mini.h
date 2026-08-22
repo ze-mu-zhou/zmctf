@@ -85,11 +85,14 @@ struct JsonParser {
           case 'r': out += '\r'; break;
           case 't': out += '\t'; break;
           case 'u': {
+            // 截断检查:c_str() 仅保证 1 个 NUL,p[1..4] 任一为空即拒绝,防 hex4 越界读
+            if (!p[1] || !p[2] || !p[3] || !p[4]) return false;
             uint32_t cp;
             if (hex4(p + 1, cp) < 0) return false;
             p += 4;
-            // 代理对:\uD83D\uDE00
-            if (cp >= 0xD800 && cp <= 0xDBFF && p[1] == '\\' && p[2] == 'u') {
+            // 代理对:\uD83D\uDE00(同样先查 p[3..6] 非空再 hex4)
+            if (cp >= 0xD800 && cp <= 0xDBFF && p[1] == '\\' && p[2] == 'u' &&
+                p[3] && p[4] && p[5] && p[6]) {
               uint32_t lo;
               if (hex4(p + 3, lo) == 0 && lo >= 0xDC00 && lo <= 0xDFFF) {
                 cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
@@ -172,20 +175,38 @@ struct JsonParser {
   }
 };
 
-/** Python json.dumps 字符串转义(ensure_ascii=True):非 ASCII → \uXXXX(代理对) */
-inline void jsonEscape(const std::string& s, std::string& out) {
+/**
+ * UTF-8 单字符解码并强校验:续字节格式、过长编码(overlong)、代理区码点、
+ * >U+10FFFF、截断序列全部拒绝;非法返回 false(与 Python 对非法输入抛错对齐)。
+ */
+inline bool utf8DecodeStrict(const std::string& s, size_t i, uint32_t& cp, size_t& adv) {
+  uint8_t c = (uint8_t)s[i];
+  if (c < 0x80) { cp = c; adv = 1; return true; }
+  uint32_t minv;
+  if ((c & 0xE0) == 0xC0) { adv = 2; cp = c & 0x1F; minv = 0x80; }
+  else if ((c & 0xF0) == 0xE0) { adv = 3; cp = c & 0x0F; minv = 0x800; }
+  else if ((c & 0xF8) == 0xF0) { adv = 4; cp = c & 0x07; minv = 0x10000; }
+  else return false; // 孤立续字节或 0xF8+(非法起始字节)
+  if (i + adv > s.size()) return false; // 序列截断
+  for (size_t k = 1; k < adv; k++) {
+    uint8_t t = (uint8_t)s[i + k];
+    if ((t & 0xC0) != 0x80) return false; // 续字节须为 10xxxxxx
+    cp = (cp << 6) | (t & 0x3F);
+  }
+  if (cp < minv || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) return false;
+  return true;
+}
+
+/** Python json.dumps 字符串转义(ensure_ascii=True):非 ASCII → \uXXXX(代理对)。
+ *  含非法 UTF-8 时返回 false,调用方应拒绝签名。 */
+inline bool jsonEscape(const std::string& s, std::string& out) {
   out += '"';
   for (size_t i = 0; i < s.size();) {
     uint8_t c = (uint8_t)s[i];
     if (c >= 0x20 && c < 0x7F && c != '"' && c != '\\') { out += (char)c; i++; continue; }
     uint32_t cp;
     size_t adv;
-    if (c < 0x80) { cp = c; adv = 1; }
-    else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; adv = 2; }
-    else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; adv = 3; }
-    else { cp = c & 0x07; adv = 4; }
-    for (size_t k = 1; k < adv && i + k < s.size(); k++)
-      cp = (cp << 6) | ((uint8_t)s[i + k] & 0x3F);
+    if (!utf8DecodeStrict(s, i, cp, adv)) return false;
     i += adv;
     if (cp < 0x80) {
       switch (cp) {
@@ -208,20 +229,21 @@ inline void jsonEscape(const std::string& s, std::string& out) {
     }
   }
   out += '"';
+  return true;
 }
 
-/** TaggedJSON 规范化:sort_keys + 紧凑分隔符 */
-inline void jsonCanonical(const Json& j, std::string& out) {
+/** TaggedJSON 规范化:sort_keys + 紧凑分隔符。非法 UTF-8 时返回 false。 */
+inline bool jsonCanonical(const Json& j, std::string& out) {
   switch (j.type) {
     case Json::NIL: out += "null"; break;
     case Json::BOOL: out += j.b ? "true" : "false"; break;
     case Json::NUM: out += j.num; break;
-    case Json::STR: jsonEscape(j.str, out); break;
+    case Json::STR: if (!jsonEscape(j.str, out)) return false; break;
     case Json::ARR:
       out += '[';
       for (size_t i = 0; i < j.arr.size(); i++) {
         if (i) out += ',';
-        jsonCanonical(j.arr[i], out);
+        if (!jsonCanonical(j.arr[i], out)) return false;
       }
       out += ']';
       break;
@@ -233,12 +255,13 @@ inline void jsonCanonical(const Json& j, std::string& out) {
       out += '{';
       for (size_t i = 0; i < items.size(); i++) {
         if (i) out += ',';
-        jsonEscape(items[i]->first, out);
+        if (!jsonEscape(items[i]->first, out)) return false;
         out += ':';
-        jsonCanonical(items[i]->second, out);
+        if (!jsonCanonical(items[i]->second, out)) return false;
       }
       out += '}';
       break;
     }
   }
+  return true;
 }

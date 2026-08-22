@@ -67,6 +67,7 @@ struct CudaCtx {
   CUcontext ctx = nullptr;
   CUmodule mod = nullptr;
   CUfunction kMask = nullptr;
+  CUfunction kDict = nullptr;
 };
 
 static HMODULE loadNvrtc() {
@@ -242,6 +243,10 @@ static CudaCtx& cuda() {
     c.error = "取 crack_mask 函数失败";
     return c;
   }
+  if (p_cuModuleGetFunction(&c.kDict, c.mod, "crack_dict") != CUDA_SUCCESS) {
+    c.error = "取 crack_dict 函数失败";
+    return c;
+  }
   if (getenv("ZK_KINFO")) { // CU_FUNC_ATTRIBUTE: LOCAL_SIZE_BYTES=3, NUM_REGS=4, MAX_THREADS=0
     int regs = 0, local = 0, maxThr = 0;
     p_cuFuncGetAttribute(&regs, 4, c.kMask);
@@ -279,7 +284,7 @@ static CUdeviceptr cuAlloc(const void* data, size_t n, CUresult* rc) {
   return d;
 }
 
-#define CHUNK_CAND (1ULL << 22) // 与 OpenCL 后端同基准
+#define CHUNK_CAND (1ULL << 24) // 与 OpenCL 后端同基准
 
 int cudaCrackMask(const GpuCrackParams& p, const std::vector<std::string>& pos, uint64_t total,
                   uint64_t& foundIdx, std::string& err) {
@@ -346,6 +351,59 @@ int cudaCrackMask(const GpuCrackParams& p, const std::vector<std::string>& pos, 
     size_t cand = (size_t)(total - base < CHUNK_CAND ? total - base : CHUNK_CAND);
     unsigned grid = (unsigned)((cand + BLOCK - 1) / BLOCK);
     CUresult r = p_cuLaunchKernel(c.kMask, grid, 1, 1, BLOCK, 1, 1, 0, nullptr, params, nullptr);
+    if (r != CUDA_SUCCESS) { err = std::string("cuLaunchKernel 失败: ") + cuErr(r); return -1; }
+    p_cuCtxSynchronize();
+    if (g_crackAbort.load(std::memory_order_relaxed)) return 1;
+    int64_t found = -1;
+    p_cuMemcpyDtoH(&found, dFound.p, 8);
+    if (found >= 0) {
+      foundIdx = (uint64_t)found;
+      return 0;
+    }
+  }
+  return 1;
+}
+
+int cudaCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, uint64_t count,
+                  uint64_t& foundIdx, std::string& err) {
+  CudaCtx& c = cuda();
+  if (!c.ready) { err = c.error; return -1; }
+  if (p.vlen > 512 || p.slen > 32) {
+    err = "GPU 参数超限(value ≤ 512B,salt ≤ 32B)";
+    return -1;
+  }
+  p_cuCtxSetCurrent(c.ctx);
+  // HMAC 预计算(与 ocl.cpp 的 gpuCrackDict 相同)
+  HmacFixedMsg saltPc, valuePc;
+  saltPc.init(p.salt, p.slen);
+  valuePc.init(p.value, p.vlen);
+  CuBuf dSalt, dValue, dWords, dFound;
+  CUresult arc = CUDA_SUCCESS;
+  dSalt.p = cuAlloc(saltPc.tailw.data(), saltPc.tailw.size() * 4, &arc);
+  dValue.p = cuAlloc(valuePc.tailw.data(), valuePc.tailw.size() * 4, &arc);
+  dWords.p = cuAlloc(words, stride * count, &arc);
+  dFound.p = cuAlloc(nullptr, 8, &arc);
+  if (!dSalt.p || !dValue.p || !dWords.p || !dFound.p) {
+    err = std::string("设备内存分配失败(字典过大?): ") + cuErr(arc);
+    return -1;
+  }
+  int64_t neg = -1;
+  p_cuMemcpyHtoD(dFound.p, &neg, 8);
+
+  uint32_t saltBlocks = (uint32_t)saltPc.tailBlocks();
+  uint32_t valueBlocks = (uint32_t)valuePc.tailBlocks();
+  uint32_t ustride = (uint32_t)stride;
+  uint32_t ew[5];
+  beWords20(p.expect, ew);
+  uint64_t base = 0, totalArg = count;
+  void* params[] = { &dSalt.p, &saltBlocks, &dValue.p, &valueBlocks,
+                     &ew[0], &ew[1], &ew[2], &ew[3], &ew[4],
+                     &dWords.p, &ustride, &base, &totalArg, &dFound.p };
+  const unsigned BLOCK = 256;
+  for (base = 0; base < count; base += CHUNK_CAND) {
+    size_t cand = (size_t)(count - base < CHUNK_CAND ? count - base : CHUNK_CAND);
+    unsigned grid = (unsigned)((cand + BLOCK - 1) / BLOCK);
+    CUresult r = p_cuLaunchKernel(c.kDict, grid, 1, 1, BLOCK, 1, 1, 0, nullptr, params, nullptr);
     if (r != CUDA_SUCCESS) { err = std::string("cuLaunchKernel 失败: ") + cuErr(r); return -1; }
     p_cuCtxSynchronize();
     if (g_crackAbort.load(std::memory_order_relaxed)) return 1;

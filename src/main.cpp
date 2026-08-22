@@ -1,21 +1,23 @@
 /**
- * zemu-crypto:密码/爆破工具集 CLI。
+ * zemu-flask:密码/爆破工具集 CLI。
  *
  * 用法:
- *   zemu-crypto flask decode --cookie <c>
- *   zemu-crypto flask verify --cookie <c> --secret <s> [--salt <salt>]
- *   zemu-crypto flask sign   --secret <s> --json <j> [--salt <salt>] [--legacy]
- *   zemu-crypto flask crack  --cookie <c> (--wordlist <f> | --mask <?l?l?d?d>)
- *                            [--salt <salt>] [--threads N] [--engine auto|gpu|cpu]
- *   zemu-crypto selftest     # SHA-NI 与便携实现对拍
- *   zemu-crypto gpuinfo      # OpenCL GPU 探测
- *   zemu-crypto gputest      # OpenCL 冒烟测试
- *   zemu-crypto serve        # stdin 服务模式(GUI 专用,进程常驻,GPU 上下文复用)
- *   zemu-crypto interactive  # 交互模式:菜单选操作,逐项提问(无参数且 stdin 是终端时自动进入)
- *   zemu-crypto help         # 彩色中文帮助(掩码规则详解)
+ *   zemu-flask flask decode --cookie <c>
+ *   zemu-flask flask verify --cookie <c> --secret <s> [--salt <salt>]
+ *   zemu-flask flask sign   --secret <s> --json <j> [--salt <salt>] [--legacy]
+ *   zemu-flask flask crack  --cookie <c> (--wordlist <f> | --mask <?l?l?d?d>)
+ *                            [--salt <salt>] [--threads N] [--engine auto|gpu|cuda|cpu]
+ *   zemu-flask selftest     # SHA-NI 与便携实现对拍
+ *   zemu-flask gpuinfo      # OpenCL GPU 探测
+ *   zemu-flask gputest      # OpenCL 冒烟测试
+ *   zemu-flask serve        # stdin 服务模式(进程常驻,GPU 上下文复用)
+ *   zemu-flask interactive  # 交互模式:菜单选操作,逐项提问(无参数且 stdin 是终端时自动进入)
+ *   zemu-flask help         # 彩色中文帮助(掩码规则详解)
  *
  * crack 结果(secret)与 sign/decode 输出走 stdout,统计、进度与交互提示走 stderr。
  * 帮助彩色输出:终端为 tty 时自动启用;ZK_COLOR=1 可强制开启(管道调试用)。
+ * 构建:仅支持 MSYS2 UCRT64 的 MinGW g++(见 build.sh);MSVC 不适用——
+ * 源码依赖 GNU __attribute__((target)) 与直接 #include <windows.h>。
  */
 #include "flask.h"
 #include "gpu/ocl.h"
@@ -96,8 +98,8 @@ static void usage(std::ostream& os, bool color) {
     GN = "\033[32m"; DIM = "\033[2m"; R = "\033[0m";
   }
   os << B << "用法:" << R << "\n"
-     << "  " << CY << "zemu-crypto" << R << "                 " << DIM << "# 无参数:进入交互模式(一问一答)" << R << "\n"
-     << "  " << CY << "zemu-crypto" << R << " <命令> [参数]\n\n"
+     << "  " << CY << "zemu-flask" << R << "                 " << DIM << "# 无参数:进入交互模式(一问一答)" << R << "\n"
+     << "  " << CY << "zemu-flask" << R << " <命令> [参数]\n\n"
 
      << B << "命令:" << R << "\n"
      << "  " << CY << "flask decode" << R << "  " << YE << "--cookie <c>" << R
@@ -110,11 +112,11 @@ static void usage(std::ostream& os, bool color) {
      << "  " << CY << "flask crack" << R << "   " << YE << "--cookie <c>" << R
      << " (" << YE << "--wordlist <f>" << R << " | " << YE << "--mask <掩码>" << R << ")\n"
      << "               [" << YE << "--salt <s>" << R << "] [" << YE << "--threads N" << R
-     << "] [" << YE << "--engine auto|gpu|cpu" << R << "]  爆破密钥\n"
+     << "] [" << YE << "--engine auto|gpu|cuda|cpu" << R << "]  爆破密钥\n"
      << "  " << CY << "selftest" << R << "        SHA-NI 与便携实现全量对拍\n"
      << "  " << CY << "gpuinfo" << R << "         探测 OpenCL GPU\n"
      << "  " << CY << "gputest" << R << "         GPU 冒烟测试\n"
-     << "  " << CY << "serve" << R << "           stdin 常驻服务(供 GUI 调用)\n"
+     << "  " << CY << "serve" << R << "           stdin 常驻服务(JSON 行协议)\n"
      << "  " << CY << "interactive" << R << "     进入交互模式(与无参数运行相同)\n"
      << "  " << CY << "help" << R << "            显示本帮助\n\n"
 
@@ -134,11 +136,17 @@ static void usage(std::ostream& os, bool color) {
      << "  " << DIM << "注意:组合数越大耗时越长;GPU 模式掩码最多 24 位,超出请加 "
      << YE << "--engine cpu" << R << DIM << "。" << R << "\n\n"
 
+     << B << "引擎(" << YE << "--engine" << R << B << "):" << R << "\n"
+     << "  " << GN << "auto" << R << "  默认。大任务 GPU 与 CPU 同时对向吃块,小任务纯 CPU\n"
+     << "  " << GN << "gpu" << R << "    仅 OpenCL GPU;失败即报错,不回退\n"
+     << "  " << GN << "cuda" << R << "   仅 CUDA 后端(需 CUDA Toolkit 的 NVRTC)\n"
+     << "  " << GN << "cpu" << R << "    仅 CPU(" << YE << "--threads" << R << " 控线程数)\n\n"
+
      << B << "示例:" << R << "\n"
-     << "  " << CY << "zemu-crypto" << R << " flask crack --cookie <c> --wordlist rockyou.txt\n"
-     << "  " << CY << "zemu-crypto" << R << " flask crack --cookie <c> --mask \""
+     << "  " << CY << "zemu-flask" << R << " flask crack --cookie <c> --wordlist rockyou.txt\n"
+     << "  " << CY << "zemu-flask" << R << " flask crack --cookie <c> --mask \""
      << GN << "?u?l?l?l?l?d?d" << R << "\"\n"
-     << "  " << CY << "zemu-crypto" << R << " flask crack --cookie <c> --mask \""
+     << "  " << CY << "zemu-flask" << R << " flask crack --cookie <c> --mask \""
      << GN << "admin?d?d?d?d" << R << "\" --engine cpu --threads 8\n\n"
 
      << DIM << "不带 --salt 时使用 Flask 默认盐 \"cookie-session\"。\n"
@@ -210,7 +218,7 @@ static int runCommand(int argc, char** argv) {
 }
 
 /**
- * stdin 服务模式(GUI 专用):每行一个 JSON 字符串数组(即 argv,不含程序名),
+ * stdin 服务模式:每行一个 JSON 字符串数组(即 argv,不含程序名),
  * stdout/stderr 合流,每条命令以 <<<zk-rc=N>>> 哨兵行结束。
  * 进程常驻:GPU 上下文初始化一次,后续 crack 不再付 ~110ms 初始化与进程创建开销。
  */
@@ -234,7 +242,7 @@ static int cmdServe() {
     if (ok && !args.empty()) {
       std::vector<char*> argv;
       argv.reserve(args.size() + 1);
-      argv.push_back((char*)"zemu-crypto");
+      argv.push_back((char*)"zemu-flask");
       for (auto& a : args) argv.push_back(a.data());
       rc = runCommand((int)argv.size(), argv.data());
     } else {
@@ -273,7 +281,7 @@ static int cmdInteractive() {
   if (color) { B = "\033[1m"; CY = "\033[36m"; GN = "\033[32m"; R = "\033[0m"; }
   bool eof = false;
   for (;;) {
-    std::cerr << "\n" << B << "===== zemu-crypto 交互模式 =====" << R << "\n"
+    std::cerr << "\n" << B << "===== zemu-flask 交互模式 =====" << R << "\n"
               << "  " << CY << "1" << R << ") flask decode  解析 cookie\n"
               << "  " << CY << "2" << R << ") flask verify  验证 cookie 签名\n"
               << "  " << CY << "3" << R << ") flask sign    用密钥签新 cookie\n"
@@ -335,7 +343,7 @@ static int cmdInteractive() {
     if (eof) break;
     std::vector<char*> argv; // 与 cmdServe 相同的 argv 拼装手法
     argv.reserve(args.size() + 1);
-    argv.push_back((char*)"zemu-crypto");
+    argv.push_back((char*)"zemu-flask");
     for (auto& a : args) argv.push_back(a.data());
     runCommand((int)argv.size(), argv.data());
   }
