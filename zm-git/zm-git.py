@@ -109,17 +109,48 @@ STATIC_FILES = [
     "HEAD", "config", "index", "packed-refs", "description",
     "COMMIT_EDITMSG", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MERGE_MSG",
     "MERGE_MODE", "SQUASH_MSG", "REVERT_HEAD", "CHERRY_PICK_HEAD", "AUTO_MERGE",
+    "shallow", "commondir", "info/grafts",
     "info/refs", "info/exclude", "info/attributes", "info/packs",
     "objects/info/packs", "objects/info/alternates", "objects/info/http-alternates",
-    "logs/HEAD", "logs/refs/stash",
+    "logs/HEAD", "logs/refs/stash", "logs/refs/notes/commits",
     "refs/stash", "refs/wip/wtree", "refs/wip/index",
+    "refs/notes/commits", "refs/bisect/bad",
     "refs/remotes/origin/HEAD", "logs/refs/remotes/origin/HEAD",
 ]
-BRANCH_NAMES = ["master", "main", "dev", "develop", "development", "test", "testing",
-                "stage", "staging", "prod", "production", "release", "hotfix", "bugfix",
-                "feature", "backup", "bak", "old", "temp", "tmp", "deploy", "gh-pages",
-                "v1", "v2", "beta", "alpha", "fix", "new", "web", "api"]
-TAG_NAMES = ["v1.0", "v0.1", "v2.0", "1.0", "0.1", "release", "init", "v1", "v2"]
+
+# 分支名爆破字典 (按真实开源项目统计的常见命名)
+BRANCH_NAMES = [
+    # 绝对主力
+    "master", "main", "dev", "develop", "development", "test", "testing",
+    "stage", "staging", "prod", "production", "pre", "preview", "release",
+    # 流程分支
+    "hotfix", "bugfix", "bug", "fix", "feature", "feat", "wip", "draft",
+    "backup", "bak", "old", "temp", "tmp", "new", "demo", "example",
+    # 环境/部署
+    "deploy", "deployment", "gh-pages", "pages", "docker", "ci", "cd",
+    "server", "client", "web", "api", "app", "admin", "backend", "frontend",
+    # 版本分支
+    "v1", "v2", "v3", "v1.0", "v2.0", "1.0", "2.0", "beta", "alpha", "rc",
+    "stable", "latest", "nightly", "release-1.0", "release-2.0",
+    # 中文开发常见
+    "dev-zm", "zm", "dev1", "dev2", "mydev", "local", "home", "work",
+    # 其他高频
+    "trunk", "default", "head", "base", "core", "common", "public",
+    "private", "secret", "hidden", "internal", "debug", "dev-test",
+    "feature-x", "init", "update", "patch", "hotfix-1", "dev-master",
+    "source", "src", "code", "data", "docs", "doc", "www", "blog",
+]
+
+# tag 爆破字典
+TAG_NAMES = [
+    "v1.0", "v0.1", "v2.0", "v1.1", "v1.0.0", "v0.0.1", "v3.0", "v2.1",
+    "1.0", "0.1", "2.0", "1.0.0", "1.1", "0.0.1",
+    "release", "init", "first", "v1", "v2", "v3", "beta", "alpha",
+    "rc1", "rc-1", "stable", "latest", "final", "release-1.0", "v1.0.1",
+]
+
+# GitHub PR 引用 (refs/pull/N/head, refs/pull/N/merge)
+PULL_RANGE = 20
 
 # 线程拉满当前环境上限 (I/O 密集型, 按 CPU 核数放大)
 MAX_THREADS = min(256, max(32, (os.cpu_count() or 8) * 16))
@@ -127,13 +158,21 @@ MAX_THREADS = min(256, max(32, (os.cpu_count() or 8) * 16))
 FIXED_OUTDIR = os.path.abspath("zm-git-output")
 
 
-def build_ref_paths():
+def build_ref_paths(extra_names=None, pull_range=PULL_RANGE):
     paths = list(STATIC_FILES)
-    for b in BRANCH_NAMES:
+    branches = list(BRANCH_NAMES)
+    tags = list(TAG_NAMES)
+    if extra_names:  # 自定义字典的词同时当分支和 tag 爆
+        branches += extra_names
+        tags += extra_names
+    for b in dict.fromkeys(branches):
         paths += [f"refs/heads/{b}", f"logs/refs/heads/{b}",
                   f"refs/remotes/origin/{b}", f"logs/refs/remotes/origin/{b}"]
-    for t in TAG_NAMES:
+    for t in dict.fromkeys(tags):
         paths += [f"refs/tags/{t}", f"logs/refs/tags/{t}"]
+    for n in range(1, pull_range + 1):
+        paths += [f"refs/pull/{n}/head", f"refs/pull/{n}/merge",
+                  f"logs/refs/pull/{n}/head"]
     return paths
 
 
@@ -162,7 +201,7 @@ def normalize_url(raw):
 
 class Dumper:
     def __init__(self, url, outdir, threads=32, proxy=None, timeout=10,
-                 use_git=True, crawl=True, brute=True):
+                 use_git=True, crawl=True, brute=True, wordlist=None, pulls=PULL_RANGE):
         self.candidates = normalize_url(url)
         self.base = None
         self.outdir_input = outdir
@@ -173,6 +212,15 @@ class Dumper:
         self.use_git = use_git and shutil.which("git") is not None
         self.crawl_enabled = crawl
         self.brute = brute
+        self.pull_range = pulls
+        self.extra_names = []
+        if wordlist:
+            try:
+                with open(wordlist, encoding="utf-8", errors="replace") as f:
+                    self.extra_names = [l.strip().strip("/") for l in f
+                                        if l.strip() and not l.startswith("#")]
+            except OSError as e:
+                warn(f"字典读取失败: {e}")
         self.soft404 = False
 
         self.session = requests.Session()
@@ -303,8 +351,8 @@ class Dumper:
 
     # ---------- 阶段 3: 静态文件 + 引用爆破 ----------
     def download_static(self):
-        paths = build_ref_paths() if self.brute else STATIC_FILES
-        info(f"下载静态文件/爆破引用 ({len(paths)} 个路径, {self.threads} 线程)")
+        paths = build_ref_paths(self.extra_names, self.pull_range) if self.brute else STATIC_FILES
+        info(f"下载静态文件/爆破引用 ({C.BOLD}{len(paths)}{C.E} 个路径, {self.threads} 线程)")
         with ThreadPoolExecutor(self.threads) as ex:
             results = list(ex.map(lambda p: (p, self.fetch(p)), paths))
         hit = 0
@@ -637,6 +685,9 @@ def main():
     ap.add_argument("--no-git", action="store_true", help="不使用本地 git (纯 python 还原)")
     ap.add_argument("--no-crawl", action="store_true", help="禁用目录列举爬取")
     ap.add_argument("--no-brute", action="store_true", help="禁用分支/tag 引用爆破")
+    ap.add_argument("-w", "--wordlist", default=None, help="自定义分支/tag 名字典 (每行一个)")
+    ap.add_argument("--pulls", type=int, default=PULL_RANGE,
+                    help=f"GitHub PR 引用爆破范围 refs/pull/1..N (默认 {PULL_RANGE}, 0 关闭)")
     ap.add_argument("--no-color", action="store_true", help="禁用彩色输出")
     args = ap.parse_args()
 
@@ -658,7 +709,8 @@ def main():
 
     outdir = args.output
     d = Dumper(args.url, outdir, args.threads, args.proxy, args.timeout,
-               use_git=not args.no_git, crawl=not args.no_crawl, brute=not args.no_brute)
+               use_git=not args.no_git, crawl=not args.no_crawl, brute=not args.no_brute,
+               wordlist=args.wordlist, pulls=args.pulls)
     try:
         sys.exit(d.run())
     except KeyboardInterrupt:
