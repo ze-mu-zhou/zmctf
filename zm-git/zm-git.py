@@ -227,6 +227,7 @@ class Dumper:
         self.session.verify = False
         self.session.trust_env = False  # 忽略环境变量代理, 代理请用 -p 显式指定
         self.session.headers["User-Agent"] = "git/2.40.0"
+        self.proxy = proxy
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
         ad = HTTPAdapter(pool_connections=threads, pool_maxsize=threads, max_retries=1)
@@ -317,6 +318,32 @@ class Dumper:
         self.gitdir = os.path.join(self.outdir, ".git")
         os.makedirs(os.path.join(self.gitdir, "objects"), exist_ok=True)
 
+    # ---------- 阶段 0: 智能协议探测 (最优路径) ----------
+    def try_smart_clone(self):
+        """若服务端是 git-http-backend, 直接 git clone 拿全量打包数据"""
+        if not self.use_git:
+            return False
+        url = self.base.rstrip("/")
+        try:
+            r = self.session.get(url + "/info/refs?service=git-upload-pack",
+                                 timeout=self.timeout)
+        except requests.RequestException:
+            return False
+        if r.status_code != 200 or "git-upload-pack" not in r.headers.get("Content-Type", ""):
+            return False
+        ok(f"服务端开启 {C.G}git 智能协议{C.E}! 直接 git clone (单次打包传输, 最快路径)")
+        import shutil as sh
+        sh.rmtree(self.outdir, ignore_errors=True)   # clone 要求目标目录不存在
+        cmd = ["clone", "--quiet"]
+        if self.proxy:
+            cmd += ["-c", f"http.proxy={self.proxy}"]
+        code, _, errout = run_git(cmd + [url, self.outdir], timeout=900)
+        if code == 0:
+            return True
+        warn(f"clone 失败 ({errout.strip()[:80]}), 回退哑协议逐对象下载")
+        os.makedirs(os.path.join(self.gitdir, "objects"), exist_ok=True)
+        return False
+
     # ---------- 阶段 2: 目录列举爬取 ----------
     def try_crawl(self):
         if not self.crawl_enabled:
@@ -399,21 +426,30 @@ class Dumper:
             if sha in self.queued:
                 return []
             self.queued.add(sha)
-        raw = self.fetch(f"objects/{sha[:2]}/{sha[2:]}", is_object=True)
-        if raw is None:
+        # 本地优先: crawl/clone 已落盘的对象不再走网络
+        local = os.path.join(self.gitdir, "objects", sha[:2], sha[2:])
+        if os.path.exists(local):
+            try:
+                raw = open(local, "rb").read()
+                de = zlib.decompress(raw)
+            except (OSError, zlib.error):
+                return []
+        else:
+            raw = self.fetch(f"objects/{sha[:2]}/{sha[2:]}", is_object=True)
+            if raw is None:
+                with self.lock:
+                    self.fail.append(sha)
+                return []
+            try:
+                de = zlib.decompress(raw)
+            except zlib.error:
+                return []
+            self.save(f"objects/{sha[:2]}/{sha[2:]}", raw)
             with self.lock:
-                self.fail.append(sha)
-            return []
-        try:
-            de = zlib.decompress(raw)
-        except zlib.error:
-            return []
-        self.save(f"objects/{sha[:2]}/{sha[2:]}", raw)
-        with self.lock:
-            self.dl_count += 1
-            n = self.dl_count
-        if n % 100 == 0:
-            print(f"\r    {C.DIM}已下载对象: {n}{C.E}", end="", flush=True)
+                self.dl_count += 1
+                n = self.dl_count
+            if n % 100 == 0:
+                print(f"\r    {C.DIM}已下载对象: {n}{C.E}", end="", flush=True)
 
         header, _, body = de.partition(b"\x00")
         otype = header.split(b" ")[0]
@@ -470,6 +506,13 @@ class Dumper:
                     except Exception:
                         pass
         print()
+        # 失败重试一轮 (网络抖动误伤)
+        if self.fail:
+            retry = list(dict.fromkeys(self.fail))
+            self.fail.clear()
+            info(f"重试 {len(retry)} 个失败对象...")
+            with ThreadPoolExecutor(min(self.threads, 32)) as ex:
+                list(ex.map(self.fetch_and_expand, retry))
         ok(f"对象下载完成: {C.BOLD}{self.dl_count}{C.E} 个, 缺失 {len(self.fail)} 个")
 
     # ---------- fsck 闭环 ----------
@@ -596,8 +639,15 @@ class Dumper:
         code, git_ver, _ = run_git(["--version"]) if self.use_git else (-1, "", "")
         info(f"本地 git: {git_ver.strip() or (C.Y + '不可用, 将纯Python手动还原' + C.E)}")
 
-        crawled = self.try_crawl()
-        if crawled == 0:
+        cloned = self.try_smart_clone()
+        crawled = 0 if cloned else self.try_crawl()
+        if cloned:
+            # clone 只拉 heads/tags, 补上 logs/stash/pull 等哑协议独有文件
+            self.download_static()
+            seeds = self.collect_seed_hashes()
+            if seeds:
+                self.download_objects(seeds)
+        elif crawled == 0:
             self.download_static()
             self.download_packs()
             seeds = self.collect_seed_hashes()
