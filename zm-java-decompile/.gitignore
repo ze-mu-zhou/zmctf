@@ -1,0 +1,13 @@
+.bin/
+.idea/
+.out/
+/out
+.gradle/
+.classpath
+.project
+.DS_Store
+*.iml
+/out/
+/target/
+
+dependency-reduced-pom.xml

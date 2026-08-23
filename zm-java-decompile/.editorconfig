@@ -1,0 +1,24 @@
+root = true
+
+[*]
+indent_style = space
+indent_size = 4
+tab_width = 4
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.java]
+max_line_length = 120
+ij_java_class_brace_style = next_line
+ij_java_method_brace_style = next_line
+ij_java_block_brace_style = next_line
+
+[*.xml]
+indent_size = 4
+tab_width = 4
+
+[*.properties]
+indent_size = 4
+tab_width = 4
