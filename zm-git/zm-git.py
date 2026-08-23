@@ -75,6 +75,22 @@ BANNER = rf"""{C.G}{C.BOLD}
 SHA1_RE = re.compile(rb"\b[0-9a-f]{40}\b")
 HREF_RE = re.compile(r'href="([^"?#][^"]*)"')
 
+
+def run_git(args, cwd=None, gitdir=None, timeout=300):
+    """统一的 git 调用: 强制 UTF-8 解码 (防中文 Windows GBK 崩溃), 永不返回 None"""
+    cmd = ["git"]
+    if gitdir:
+        cmd += ["--git-dir", gitdir]
+    if cwd:
+        cmd += ["-C", cwd]
+    cmd += args
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return r.returncode, r.stdout or "", r.stderr or ""
+    except (OSError, subprocess.TimeoutExpired):
+        return -1, "", ""
+
 STATIC_FILES = [
     "HEAD", "config", "index", "packed-refs", "description",
     "COMMIT_EDITMSG", "ORIG_HEAD", "FETCH_HEAD", "MERGE_HEAD", "MERGE_MSG",
@@ -293,9 +309,8 @@ class Dumper:
         if os.path.exists(p):
             return True
         if self.use_git:
-            r = subprocess.run(["git", "--git-dir", self.gitdir, "cat-file", "-e", sha],
-                               capture_output=True)
-            return r.returncode == 0
+            code, _, _ = run_git(["cat-file", "-e", sha], gitdir=self.gitdir)
+            return code == 0
         return False
 
     def fetch_and_expand(self, sha):
@@ -381,17 +396,15 @@ class Dumper:
         if not self.use_git:
             return
         for it in range(8):
-            r = subprocess.run(
-                ["git", "--git-dir", self.gitdir, "fsck", "--full", "--unreachable", "--dangling"],
-                capture_output=True, text=True, timeout=300)
-            hashes = set(m.group(0) for m in SHA1_RE.finditer((r.stdout + r.stderr).encode()))
+            _, out, errout = run_git(["fsck", "--full", "--unreachable", "--dangling"],
+                                     gitdir=self.gitdir)
+            hashes = set(m.group(0) for m in SHA1_RE.finditer((out + errout).encode()))
             new = [h for h in hashes if not self.object_exists_local(h)]
             if not new:
                 break
             info(f"fsck 第 {it + 1} 轮: 发现 {C.Y}{len(new)}{C.E} 个缺失对象, 继续下载")
             self.download_objects(new)
-        subprocess.run(["git", "--git-dir", self.gitdir, "fsck", "--lost-found"],
-                       capture_output=True, timeout=300)
+        run_git(["fsck", "--lost-found"], gitdir=self.gitdir)
 
     # ---------- 还原工作区 ----------
     def parse_index(self):
@@ -449,9 +462,9 @@ class Dumper:
 
     def restore_git(self):
         for cmd in (["checkout", "-f", "HEAD"], ["reset", "--hard", "HEAD"]):
-            subprocess.run(["git", "-C", self.outdir] + cmd, capture_output=True, timeout=120)
-        r = subprocess.run(["git", "-C", self.outdir, "ls-files"], capture_output=True, text=True)
-        n = len(r.stdout.strip().splitlines()) if r.returncode == 0 else 0
+            run_git(cmd, cwd=self.outdir, timeout=120)
+        code, out, _ = run_git(["ls-files"], cwd=self.outdir)
+        n = len(out.strip().splitlines()) if code == 0 and out else 0
         ok(f"git 还原工作区完成, 追踪文件: {C.BOLD}{n}{C.E}")
         return n
 
@@ -461,9 +474,8 @@ class Dumper:
             return 1
         self.setup_dirs()
         self.detect_soft404()
-        git_ver = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip() \
-            if self.use_git else None
-        info(f"本地 git: {git_ver or (C.Y + '不可用, 将纯Python手动还原' + C.E)}")
+        code, git_ver, _ = run_git(["--version"]) if self.use_git else (-1, "", "")
+        info(f"本地 git: {git_ver.strip() or (C.Y + '不可用, 将纯Python手动还原' + C.E)}")
 
         crawled = self.try_crawl()
         if crawled == 0:
@@ -485,9 +497,8 @@ class Dumper:
 
         n_commits = 0
         if self.use_git:
-            r = subprocess.run(["git", "-C", self.outdir, "log", "--all", "--oneline"],
-                               capture_output=True, text=True)
-            n_commits = len(r.stdout.strip().splitlines()) if r.returncode == 0 else 0
+            code, out, _ = run_git(["log", "--all", "--oneline"], cwd=self.outdir)
+            n_commits = len(out.strip().splitlines()) if code == 0 and out else 0
 
         print(f"\n{C.M}{C.BOLD}========== 结果 =========={C.E}")
         ok(f"loose objects: {self.dl_count}  |  缺失: {len(self.fail)}  |  commit: {C.G}{n_commits}{C.E}")
