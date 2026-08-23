@@ -1,0 +1,74 @@
+name: Update Star Charts
+
+on:
+  schedule:
+    - cron: "42 */8 * * *"
+  # push:
+  #   branches:
+  #     - main
+  #     - dev
+  workflow_dispatch:
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Switch to images branch
+        uses: actions/checkout@v4
+        with:
+          ref: "images"
+
+      - name: Update badges (unchanged)
+        run: |
+          wget -O assets/run-tests.svg https://github.com/Marven11/Fenjing/actions/workflows/run-tests.yml/badge.svg
+          wget -O assets/python-package.svg https://github.com/Marven11/Fenjing/actions/workflows/python-publish.yml/badge.svg
+          wget -O assets/codecov.svg https://codecov.io/gh/Marven11/Fenjing/branch/main/graph/badge.svg?token=DLP7OH52P3
+          wget -O assets/downloads.svg https://static.pepy.tech/badge/fenjing
+          wget -O assets/downloads-monthly.svg https://static.pepy.tech/badge/fenjing/month
+          wget -O assets/license.svg https://img.shields.io/badge/license-MPL2.0-blue
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        run: npm install -g pnpm@9
+
+      - name: Fetch gen-fenjing-svg.ts from main branch
+        run: |
+          # images 分支可能没有这个脚本,从 main 分支捞
+          git fetch origin main --depth=1
+          git checkout origin/main -- .github/scripts/gen-fenjing-svg.ts
+
+      - name: Generate stars.svg via star-history open-source renderer
+        env:
+          # stargazers 端点只需 "Metadata: read" 权限 + 仓库 collaborator 身份。
+          # GitHub Actions 自带 GITHUB_TOKEN 对本仓库满足这两个条件(metadata 是
+          # GitHub App installation token 的隐式必选读权限),所以默认零配置可用,
+          # 无需自建 secret。STARGAZERS_API_TOKEN 仅作可选 fallback:若个别仓库因
+          # 组织策略等被拒(403),设此 secret 即可覆盖。
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          SH_DIR="$RUNNER_TEMP/star-history"
+          git clone --depth 1 https://github.com/star-history/star-history "$SH_DIR"
+
+          ( cd "$SH_DIR" && pnpm install --no-frozen-lockfile )
+          ( cd "$SH_DIR/backend" && pnpm install --no-frozen-lockfile )
+
+          cp .github/scripts/gen-fenjing-svg.ts "$SH_DIR/backend/"
+
+          ( cd "$SH_DIR/backend" && ./node_modules/.bin/tsx gen-fenjing-svg.ts ) > assets/stars.svg
+
+      - name: Commit
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git config --local user.email "actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add . && git commit -m 'Update: '"$(date)" && git push

@@ -1,0 +1,1 @@
+gopher://127.0.0.1:25/_hello%20file%20content%0Aline2

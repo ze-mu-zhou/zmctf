@@ -1,0 +1,8 @@
+requests
+beautifulsoup4
+click
+jinja2
+prompt_toolkit
+pygments
+pysocks
+rich>=12

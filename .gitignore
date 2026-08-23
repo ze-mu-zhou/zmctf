@@ -5,12 +5,22 @@ bin/
 # Python
 __pycache__/
 *.pyc
+*.pyo
 .venv/
+venv/
 
 # 基准测试生成的大字典(由 tests/bench.py 按需生成)
 tests/wl-bench*.txt
+
+# 超过 GitHub 100MB 限制的大字典文件
+zemu-dict/rockyou.txt
+zemu-flask/flask-unsign/tests/wl-bench16.txt
 
 # 编辑器/系统
 *.user
 .DS_Store
 Thumbs.db
+node_modules/
+
+# zm-git 输出
+zm-git-output/

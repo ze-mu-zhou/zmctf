@@ -1,0 +1,6 @@
+[submodule "zemu-flask/flask-unsign"]
+	path = zemu-flask/flask-unsign
+	url = https://github.com/ze-mu-zhou/zemu-flask.git
+[submodule "zemu-sql/sqlmap"]
+	path = zemu-sql/sqlmap
+	url = https://gitee.com/mirrors/sqlmap.git
