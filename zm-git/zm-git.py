@@ -75,6 +75,20 @@ BANNER = rf"""{C.G}{C.BOLD}
 SHA1_RE = re.compile(rb"\b[0-9a-f]{40}\b")
 HREF_RE = re.compile(r'href="([^"?#][^"]*)"')
 
+# HEAD 被禁时的次级探测文件: (路径, 内容签名验证器)
+PROBE_FILES = [
+    ("config",             lambda d: b"[core]" in d and b"repositoryformatversion" in d),
+    ("description",        lambda d: b"repository" in d[:200]),
+    ("index",              lambda d: d[:4] == b"DIRC"),
+    ("packed-refs",        lambda d: d.lstrip().startswith(b"# pack-refs") or bool(SHA1_RE.search(d))),
+    ("objects/info/packs", lambda d: d.lstrip().startswith(b"P pack-")),
+    ("logs/HEAD",          lambda d: len(SHA1_RE.findall(d)) >= 2),
+]
+
+# 目录列举页中的 git 特征条目 (至少出现 2 个才确认, 防误报)
+LISTING_SIGS = (b'"objects/"', b'"refs/"', b'"HEAD"', b'"packed-refs"',
+                b'"config"', b'"info/"', b'"logs/"', b'"hooks/"')
+
 
 def run_git(args, cwd=None, gitdir=None, timeout=300):
     """统一的 git 调用: 强制 UTF-8 解码 (防中文 Windows GBK 崩溃), 永不返回 None"""
@@ -217,6 +231,8 @@ class Dumper:
 
     # ---------- 阶段 1: 检测 (自动选择可用 base) ----------
     def check(self):
+        self.base = self.candidates[0]
+        self.detect_soft404()
         for cand in self.candidates:
             info(f"尝试: {C.BOLD}{cand}{C.E}")
             self.base = cand
@@ -224,6 +240,19 @@ class Dumper:
             if d and (d.startswith(b"ref:") or SHA1_RE.fullmatch(d.strip())):
                 ok(f".git 泄露确认! HEAD => {C.Y}{d.decode(errors='replace').strip()}{C.E}")
                 return True
+            # HEAD 被禁的畸形配置: 用带签名校验的次级文件兑底
+            for path, validator in PROBE_FILES:
+                d = self.fetch(path)
+                if d and validator(d):
+                    ok(f".git 泄露确认! (HEAD 不可读, 通过 {C.Y}{path}{C.E} 签名确认)")
+                    return True
+            # 文件全 403 但目录列举开着: 看列举页里的 git 特征条目
+            code, body = self._raw("")
+            if code == 200 and b"href=" in body:
+                hits = sum(1 for s in LISTING_SIGS if s in body)
+                if hits >= 2:
+                    ok(f".git 泄露确认! (文件被禁, 通过{C.Y}目录列举{C.E}发现 {hits} 个 git 特征)")
+                    return True
             dim("不可用, 换下一个候选" if cand != self.candidates[-1] else "")
         err("未发现 .git 泄露")
         return False
@@ -410,6 +439,45 @@ class Dumper:
             self.download_objects(new)
         run_git(["fsck", "--lost-found"], gitdir=self.gitdir)
 
+    # ---------- HEAD/index 丢失时从对象重建 ----------
+    def rebuild_head_from_objects(self):
+        """从已下载对象中找 commit, 把 tip commit 重建为 HEAD (兼容 pack 里的对象)"""
+        commits = {}  # sha -> set(parent shas)
+        if self.use_git:
+            # git 要求仓库必须有 HEAD 才认可, 先写占位
+            self.save("HEAD", b"ref: refs/heads/master\n")
+            code, out, _ = run_git(["cat-file", "--batch-all-objects", "--batch-check"],
+                                   gitdir=self.gitdir)
+            shas = [l.split()[0] for l in out.splitlines() if l.split()[1:2] == ["commit"]]
+            for s in shas:
+                _, body, _ = run_git(["cat-file", "-p", s], gitdir=self.gitdir)
+                commits[s] = set(re.findall(r"parent ([0-9a-f]{40})", body))
+        else:
+            odir = os.path.join(self.gitdir, "objects")
+            for d1 in os.listdir(odir):
+                if len(d1) != 2:
+                    continue
+                for fn in os.listdir(os.path.join(odir, d1)):
+                    try:
+                        de = zlib.decompress(open(os.path.join(odir, d1, fn), "rb").read())
+                    except Exception:
+                        continue
+                    header, _, body = de.partition(b"\x00")
+                    if header.startswith(b"commit"):
+                        commits[d1 + fn] = set(p.decode() for p in
+                                               re.findall(rb"parent ([0-9a-f]{40})", body))
+        if not commits:
+            return False
+        all_parents = set().union(*commits.values())
+        tips = [s for s in commits if s not in all_parents] or list(commits)
+        tip = tips[0]
+        self.save("HEAD", b"ref: refs/heads/master\n")
+        self.save("refs/heads/master", (tip + "\n").encode())
+        ok(f"从对象重建 HEAD -> {C.Y}{tip[:8]}{C.E} (共 {len(commits)} 个 commit, {len(tips)} 个 tip)")
+        if len(tips) > 1:
+            dim("多个 tip, 其余可用 git fsck --lost-found 找回")
+        return True
+
     # ---------- 还原工作区 ----------
     def parse_index(self):
         idx = os.path.join(self.gitdir, "index")
@@ -477,7 +545,6 @@ class Dumper:
         if not self.check():
             return 1
         self.setup_dirs()
-        self.detect_soft404()
         code, git_ver, _ = run_git(["--version"]) if self.use_git else (-1, "", "")
         info(f"本地 git: {git_ver.strip() or (C.Y + '不可用, 将纯Python手动还原' + C.E)}")
 
@@ -494,6 +561,10 @@ class Dumper:
                 self.download_objects(seeds)
 
         self.fsck_loop()
+
+        # HEAD/refs 被禁的场景: 从对象里重建 HEAD 再还原
+        if not os.path.exists(os.path.join(self.gitdir, "HEAD")):
+            self.rebuild_head_from_objects()
 
         restored = self.restore_git() if self.use_git else 0
         if restored == 0:
