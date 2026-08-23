@@ -124,8 +124,11 @@ def build_ref_paths():
 
 
 def normalize_url(raw):
-    """宽松解析: 接受 127.0.0.1:1234 / site.com / site.com/.git / https://... 等
-    返回候选 base 列表 (无协议输入时 http/https 都试)"""
+    """宽松解析: 接受 127.0.0.1:1234 / site.com / site.com/.git / site.com/repo 等
+    返回候选 base 列表:
+      - 无协议输入时 http/https 都试
+      - 路径含 .git: 原样使用
+      - 路径不含 .git: 优先试 补/.git, 再试 路径本身(兼容 git 文件直接挂路径下的情况)"""
     raw = raw.strip()
     if not raw:
         return []
@@ -137,9 +140,10 @@ def normalize_url(raw):
     else:
         host_path = raw
     host_path = host_path.strip("/")
-    if ".git" not in host_path:
-        host_path = host_path + "/.git" if host_path else ".git"
-    return [f"{s}://{host_path}/" for s in schemes]
+    if not host_path:
+        host_path = ".git"
+    paths = [host_path] if ".git" in host_path else [host_path + "/.git", host_path]
+    return [f"{s}://{p}/" for p in paths for s in schemes]
 
 
 class Dumper:
