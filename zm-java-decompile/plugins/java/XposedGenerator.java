@@ -15,7 +15,7 @@ import javax.swing.JPanel;
 import org.objectweb.asm.tree.ClassNode;
 import the.bytecode.club.bytecodeviewer.*;
 import the.bytecode.club.bytecodeviewer.api.*;
-import the.bytecode.club.bytecodeviewer.decompilers.impl.FernFlowerDecompiler;
+import the.bytecode.club.bytecodeviewer.decompilers.impl.VineflowerDecompiler;
 import the.bytecode.club.bytecodeviewer.gui.resourceviewer.viewer.ResourceViewer;
 
 /**
@@ -65,10 +65,10 @@ public class XposedGenerator extends Plugin
 
             //Use one of the decompilers
             //TODO:Allow users to select other decompilers?
-            FernFlowerDecompiler decompilefern = new FernFlowerDecompiler();
+            VineflowerDecompiler decompilevine = new VineflowerDecompiler();
 
-            //Decompile using Fern
-            String decomp = decompilefern.decompileClassNode(classNode, cont);
+            //Decompile using Vineflower
+            String decomp = decompilevine.decompileClassNode(classNode, cont);
             String[] xposedTemplateTypes = {"Empty", "Parameters", "Helper"};
             @SuppressWarnings({"unchecked", "rawtypes"})
             JComboBox xposedTemplateList = new JComboBox(xposedTemplateTypes);

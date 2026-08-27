@@ -181,7 +181,7 @@ public class SecurityMan extends SecurityManager
             || fullyQualifiedClassName.equals(KrakatauDisassembler.class.getCanonicalName())
             || fullyQualifiedClassName.equals(CFRDecompiler.class.getCanonicalName())
             || fullyQualifiedClassName.equals(ProcyonDecompiler.class.getCanonicalName())
-            || fullyQualifiedClassName.equals(FernFlowerDecompiler.class.getCanonicalName())
+            || fullyQualifiedClassName.equals(VineflowerDecompiler.class.getCanonicalName())
             || fullyQualifiedClassName.equals(JDGUIDecompiler.class.getCanonicalName())
             || fullyQualifiedClassName.equals(KrakatauAssembler.class.getCanonicalName())
             || fullyQualifiedClassName.equals(ExternalResources.class.getCanonicalName())

@@ -1,0 +1,74 @@
+# Dirsearch started Mon Aug 24 09:56:10 2026 as: /usr/lib/python3/dist-packages/dirsearch/dirsearch.py -u http://127.0.0.1:53147 -t 30 --timeout=5 -q
+
+403   317B   http://127.0.0.1:53147/.ht_wsr.txt
+403   317B   http://127.0.0.1:53147/.htaccess.bak1
+403   317B   http://127.0.0.1:53147/.htaccess.orig
+403   317B   http://127.0.0.1:53147/.htaccess.sample
+403   317B   http://127.0.0.1:53147/.htaccess.save
+403   317B   http://127.0.0.1:53147/.htaccess_extra
+403   317B   http://127.0.0.1:53147/.htaccess_orig
+403   317B   http://127.0.0.1:53147/.htaccess_sc
+403   317B   http://127.0.0.1:53147/.htaccessBAK
+403   317B   http://127.0.0.1:53147/.htaccessOLD2
+403   317B   http://127.0.0.1:53147/.htm
+403   317B   http://127.0.0.1:53147/.htpasswds
+403   317B   http://127.0.0.1:53147/.htpasswd_test
+403   317B   http://127.0.0.1:53147/.httr-oauth
+403   317B   http://127.0.0.1:53147/.htaccessOLD
+403   317B   http://127.0.0.1:53147/.html
+301   355B   http://127.0.0.1:53147/admin    -> REDIRECTS TO: http://127.0.0.1:53147/admin/
+403    26B   http://127.0.0.1:53147/admin/
+403    26B   http://127.0.0.1:53147/admin/index.php
+403    43B   http://127.0.0.1:53147/admin/upload.php
+403   317B   http://127.0.0.1:53147/assets/
+301   356B   http://127.0.0.1:53147/assets    -> REDIRECTS TO: http://127.0.0.1:53147/assets/
+301   354B   http://127.0.0.1:53147/data    -> REDIRECTS TO: http://127.0.0.1:53147/data/
+403   317B   http://127.0.0.1:53147/data/autosuggest
+403   317B   http://127.0.0.1:53147/data/
+403   317B   http://127.0.0.1:53147/data/cache/
+403   317B   http://127.0.0.1:53147/data/debug/
+403   317B   http://127.0.0.1:53147/data/backups/
+403   317B   http://127.0.0.1:53147/data/adminer.php
+403   317B   http://127.0.0.1:53147/data/DoctrineORMModule/cache/
+403   317B   http://127.0.0.1:53147/data/sessions/
+403   317B   http://127.0.0.1:53147/data/DoctrineORMModule/Proxy/
+403   317B   http://127.0.0.1:53147/data/logs/
+403   317B   http://127.0.0.1:53147/data/files/
+403   317B   http://127.0.0.1:53147/data/tmp/
+301   359B   http://127.0.0.1:53147/fileadmin    -> REDIRECTS TO: http://127.0.0.1:53147/fileadmin/
+403   317B   http://127.0.0.1:53147/fileadmin/
+403   317B   http://127.0.0.1:53147/fileadmin/user_upload/
+403   317B   http://127.0.0.1:53147/includes/adovbs.inc
+301   358B   http://127.0.0.1:53147/includes    -> REDIRECTS TO: http://127.0.0.1:53147/includes/
+403   317B   http://127.0.0.1:53147/includes/
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/browser/default/connectors/asp/connector.asp
+403   317B   http://127.0.0.1:53147/includes/configure.php~
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/browser/default/connectors/aspx/connector.aspx
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/browser/default/connectors/php/connector.php
+403   317B   http://127.0.0.1:53147/includes/bootstrap.inc
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/connectors/php/upload.php
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/connectors/asp/upload.asp
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/connectors/aspx/connector.aspx
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/connectors/aspx/upload.aspx
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/connectors/php/connector.php
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/upload/asp/upload.asp
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/upload/aspx/upload.aspx
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/connectors/asp/connector.asp
+403   317B   http://127.0.0.1:53147/includes/fckeditor/editor/filemanager/upload/php/upload.php
+403   317B   http://127.0.0.1:53147/includes/swfupload/swfupload_f9.swf
+403   317B   http://127.0.0.1:53147/includes/swfupload/swfupload.swf
+403   317B   http://127.0.0.1:53147/includes/tinymce
+403   317B   http://127.0.0.1:53147/includes/tiny_mce/
+403   317B   http://127.0.0.1:53147/includes/js/tiny_mce
+403   317B   http://127.0.0.1:53147/includes/tiny_mce
+403   317B   http://127.0.0.1:53147/includes/js/tiny_mce/
+403   317B   http://127.0.0.1:53147/includes/tinymce/
+200   636B   http://127.0.0.1:53147/login.php
+302     0B   http://127.0.0.1:53147/logout.php    -> REDIRECTS TO: /index.php
+200   695B   http://127.0.0.1:53147/register.php
+200     2KB  http://127.0.0.1:53147/server-status/
+200     2KB  http://127.0.0.1:53147/server-status
+301   359B   http://127.0.0.1:53147/templates    -> REDIRECTS TO: http://127.0.0.1:53147/templates/
+403   317B   http://127.0.0.1:53147/templates/
+403   317B   http://127.0.0.1:53147/uploads/
+301   357B   http://127.0.0.1:53147/uploads    -> REDIRECTS TO: http://127.0.0.1:53147/uploads/

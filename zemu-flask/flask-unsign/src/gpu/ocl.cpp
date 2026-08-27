@@ -41,7 +41,9 @@ using cl_command_queue_properties = cl_ulong;
 #define CL_DEVICE_NAME 0x102B
 #define CL_MEM_READ_WRITE (1ULL << 0)
 #define CL_MEM_READ_ONLY (1ULL << 2)
+#define CL_MEM_ALLOC_HOST_PTR (1ULL << 4)
 #define CL_MEM_COPY_HOST_PTR (1ULL << 5)
+#define CL_MAP_WRITE (1ULL << 1)
 #define CL_PROGRAM_BUILD_LOG 0x1183
 #define CL_PROGRAM_BINARY_SIZES 0x1165
 #define CL_PROGRAM_BINARIES 0x1166
@@ -64,8 +66,15 @@ CL_FN(cl_mem, clCreateBuffer, (cl_context, cl_mem_flags, size_t, void*, cl_int*)
 CL_FN(cl_int, clSetKernelArg, (cl_kernel, cl_uint, size_t, const void*));
 CL_FN(cl_int, clEnqueueWriteBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, const void*, cl_uint, const cl_event*, cl_event*));
 CL_FN(cl_int, clEnqueueReadBuffer, (cl_command_queue, cl_mem, cl_uint, size_t, size_t, void*, cl_uint, const cl_event*, cl_event*));
+CL_FN(cl_int, clEnqueueCopyBuffer, (cl_command_queue, cl_mem, cl_mem, size_t, size_t, size_t,
+                                    cl_uint, const cl_event*, cl_event*));
+CL_FN(void*, clEnqueueMapBuffer, (cl_command_queue, cl_mem, cl_uint, cl_ulong, size_t, size_t,
+                                  cl_uint, const cl_event*, cl_event*, cl_int*));
+CL_FN(cl_int, clEnqueueUnmapMemObject, (cl_command_queue, cl_mem, void*, cl_uint,
+                                        const cl_event*, cl_event*));
 CL_FN(cl_int, clEnqueueNDRangeKernel, (cl_command_queue, cl_kernel, cl_uint, const size_t*, const size_t*, const size_t*, cl_uint, const cl_event*, cl_event*));
 CL_FN(cl_int, clFinish, (cl_command_queue));
+CL_FN(cl_int, clReleaseEvent, (cl_event));
 CL_FN(cl_int, clReleaseMemObject, (cl_mem));
 CL_FN(cl_int, clReleaseKernel, (cl_kernel));
 CL_FN(cl_int, clReleaseProgram, (cl_program));
@@ -91,6 +100,7 @@ struct OclCtx {
   cl_device_id dev = nullptr;
   cl_context ctx = nullptr;
   cl_command_queue q = nullptr;
+  cl_command_queue q2 = nullptr; // 流水上传的 DMA 队列(与 q 上的 kernel 重叠)
   cl_program prog = nullptr;
   cl_kernel kMask = nullptr;
   cl_kernel kDict = nullptr;
@@ -212,8 +222,11 @@ static bool loadApi(std::string& err) {
   RESOLVE(clCreateProgramWithSource) RESOLVE(clCreateProgramWithBinary) RESOLVE(clGetProgramInfo)
   RESOLVE(clBuildProgram) RESOLVE(clGetProgramBuildInfo)
   RESOLVE(clCreateKernel) RESOLVE(clGetKernelWorkGroupInfo) RESOLVE(clCreateBuffer) RESOLVE(clSetKernelArg)
-  RESOLVE(clEnqueueWriteBuffer) RESOLVE(clEnqueueReadBuffer) RESOLVE(clEnqueueNDRangeKernel)
-  RESOLVE(clFinish) RESOLVE(clReleaseMemObject) RESOLVE(clReleaseKernel)
+  RESOLVE(clEnqueueWriteBuffer) RESOLVE(clEnqueueReadBuffer)
+  RESOLVE(clEnqueueCopyBuffer) RESOLVE(clEnqueueMapBuffer) RESOLVE(clEnqueueUnmapMemObject)
+  RESOLVE(clEnqueueNDRangeKernel)
+  RESOLVE(clFinish) RESOLVE(clReleaseEvent)
+  RESOLVE(clReleaseMemObject) RESOLVE(clReleaseKernel)
   RESOLVE(clReleaseProgram) RESOLVE(clReleaseCommandQueue) RESOLVE(clReleaseContext)
 #undef RESOLVE
   if (!ok) err = "OpenCL.dll 导出函数不完整";
@@ -259,6 +272,10 @@ static OclCtx& ocl() {
   if (e != CL_SUCCESS) { c.error = "创建 context 失败"; return c; }
   c.q = p_clCreateCommandQueue(c.ctx, c.dev, 0, &e);
   if (e != CL_SUCCESS) { c.error = "创建 queue 失败"; return c; }
+  // 第二队列供字典 pinned 分块流水(DMA 拷贝与 kernel 重叠);失败不致命(退单队列串行)
+  cl_int e2 = CL_SUCCESS;
+  c.q2 = p_clCreateCommandQueue(c.ctx, c.dev, 0, &e2);
+  if (!c.q2 || e2 != CL_SUCCESS) c.q2 = c.q;
   const char* src = FLASK_CRACK_CL;
   size_t srcLen = strlen(src);
 
@@ -385,6 +402,43 @@ bool gpuWarm() {
   return g_peek && g_peek->ready;
 }
 
+/**
+ * pinned 主机缓冲:CL_MEM_ALLOC_HOST_PTR + map 拿直写地址;pack 直写此处,
+ * 上传时 copyBuffer 走 DMA(NVIDIA 对 pageable 的 COPY_HOST_PTR 要内部再拷一档)。
+ * 失败返回空——调用方回退普通 vector 打包,功能不受影响。
+ */
+OclHostBuf oclHostAlloc(size_t bytes) {
+  OclHostBuf r;
+  OclCtx& c = ocl();
+  if (!c.ready || bytes == 0) return r;
+  cl_int e = CL_SUCCESS;
+  cl_mem m = p_clCreateBuffer(c.ctx, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, bytes, nullptr, &e);
+  if (!m || e != CL_SUCCESS) {
+    if (m) p_clReleaseMemObject(m);
+    return r;
+  }
+  void* p = p_clEnqueueMapBuffer(c.q, m, CL_TRUE, CL_MAP_WRITE, 0, bytes, 0, nullptr, nullptr, &e);
+  if (!p || e != CL_SUCCESS) {
+    p_clReleaseMemObject(m);
+    return r;
+  }
+  r.ptr = p;
+  r.size = bytes;
+  r.mem = (void*)m;
+  return r;
+}
+
+void oclHostFree(OclHostBuf& b) {
+  if (!b.mem) return;
+  OclCtx& c = ocl();
+  if (c.ready && b.ptr) {
+    p_clEnqueueUnmapMemObject(c.q, (cl_mem)b.mem, b.ptr, 0, nullptr, nullptr);
+    p_clFinish(c.q);
+  }
+  p_clReleaseMemObject((cl_mem)b.mem);
+  b = OclHostBuf();
+}
+
 /** 冒烟测试:跑一个只写常量的 kernel,验证 OpenCL 基础链路 */
 int gpuSmokeTest(std::string& err) {
   OclCtx& c = ocl();
@@ -413,107 +467,150 @@ int gpuSmokeTest(std::string& err) {
 // 块间同步开销摊薄到 <0.5%,也保留命中早退与取消的粒度
 #define CHUNK_CAND (1ULL << 24)
 
-/** 公共调度:分块 enqueue,块间读 found 早退;total 越界保护由 kernel 负责。
- *  hybrid 非空时改为混合调度:从 ctl.head 升序领块,块间查 ctl.stop(CPU 侧命中)。
- *  rawMap 非空(字典)时块号是原字典序号空间,二分映射到 packed 子区间再 enqueue。 */
+struct PipeUp {
+  cl_mem src;
+  cl_mem dst;
+  size_t stride;
+};
+
+/** 公共调度:统一认领 raw 区间,映射到 packed 区间后 enqueue。
+ *  pipe 非空时在 q2 预取下一段字典数据,q 上 kernel 等待对应 copy event。 */
 static int runChunks(OclCtx& c, cl_kernel k, cl_mem foundBuf, uint64_t total, int baseArgIdx,
                      int totalArgIdx, uint64_t& foundIdx, std::string& err,
                      HybridCtl* hyb = nullptr, const std::vector<size_t>* rawMap = nullptr,
-                     uint64_t* attemptsOut = nullptr) {
+                     uint64_t* attemptsOut = nullptr, const PipeUp* pipe = nullptr) {
   cl_int e = p_clSetKernelArg(k, totalArgIdx, sizeof(uint64_t), &total);
   if (e != CL_SUCCESS) { err = "设置 total 参数失败"; return -1; }
   using clk = std::chrono::steady_clock;
   auto t0 = clk::now();
   auto lastPrint = t0;
 
-  if (hyb) {
-    // ---- 混合调度:与 CPU 对向推进;越界进入 CPU 认领区即止(重叠≤1 块,重复验无害) ----
-    uint64_t attempted = 0;
-    while (!hyb->stop.load(std::memory_order_relaxed)) {
-      uint64_t base = hyb->head.fetch_add(CHUNK_CAND, std::memory_order_relaxed);
-      if (base >= total) break;
-      if (base >= hyb->tail.load(std::memory_order_relaxed)) break; // 剩余归 CPU
-      uint64_t end = base + CHUNK_CAND < total ? base + CHUNK_CAND : total;
-      attempted += end - base;
-      uint64_t pLo = base, pHi = end; // packed 子区间(掩码:与 raw 同空间)
-      if (rawMap) {
-        pLo = (uint64_t)(std::lower_bound(rawMap->begin(), rawMap->end(), (size_t)base) - rawMap->begin());
-        pHi = (uint64_t)(std::lower_bound(rawMap->begin(), rawMap->end(), (size_t)end) - rawMap->begin());
-      }
-      if (pHi > pLo) { // 整块都是超长词(dict)时只计数不 enqueue
-        uint64_t pbase = pLo, ptotal = pHi;
-        p_clSetKernelArg(k, baseArgIdx, sizeof(uint64_t), &pbase);
-        p_clSetKernelArg(k, totalArgIdx, sizeof(uint64_t), &ptotal);
-        size_t cnt = (size_t)(pHi - pLo);
-        size_t offset = 0, gws = cnt, lws = c.lws, *plws = nullptr;
-        if (lws) { gws = (cnt + lws - 1) / lws * lws; plws = &lws; }
-        e = p_clEnqueueNDRangeKernel(c.q, k, 1, &offset, &gws, plws, 0, nullptr, nullptr);
-        if (e != CL_SUCCESS) {
-          hyb->stop.store(true, std::memory_order_relaxed);
-          if (attemptsOut) *attemptsOut = attempted;
-          err = "enqueue 失败";
-          return -1;
-        }
-        p_clFinish(c.q);
-        auto now = clk::now();
-        if (now - lastPrint >= std::chrono::seconds(10)) {
-          double el = std::chrono::duration<double>(now - t0).count();
-          fprintf(stderr, "[~] 进度 %llu/%llu(%.1f%%),%.0fM/s\n",
-                  (unsigned long long)attempted, (unsigned long long)total,
-                  attempted * 100.0 / total, (el > 0 ? attempted / el : 0) / 1e6);
-          lastPrint = now;
-        }
-        if (g_crackAbort.load(std::memory_order_relaxed)) {
-          hyb->stop.store(true, std::memory_order_relaxed);
-          if (attemptsOut) *attemptsOut = attempted;
-          return 1;
-        }
-        int64_t found = -1;
-        p_clEnqueueReadBuffer(c.q, foundBuf, CL_TRUE, 0, sizeof found, &found, 0, nullptr, nullptr);
-        if (found >= 0) {
-          foundIdx = rawMap ? (uint64_t)(*rawMap)[(size_t)found] : (uint64_t)found;
-          hyb->stop.store(true, std::memory_order_relaxed);
-          if (attemptsOut) *attemptsOut = attempted;
-          return 0;
-        }
-      }
+  struct Chunk {
+    uint64_t rawLo = 0, rawHi = 0;
+    uint64_t packedLo = 0, packedHi = 0;
+  };
+  uint64_t cursor = 0;
+  auto claim = [&](Chunk& out) {
+    // 混合字典时 total 是 packed 数量,但 head/tail 和 rawMap 使用原字典索引空间。
+    // 必须在 raw 空间切块,再映射到 packed 区间,否则跳过词后面的候选会漏查。
+    const uint64_t rawTotal = (hyb && rawMap) ? hyb->tail.load(std::memory_order_relaxed) : total;
+    uint64_t lo;
+    if (hyb) {
+      if (hyb->stop.load(std::memory_order_relaxed)) return false;
+      lo = hyb->head.fetch_add(CHUNK_CAND, std::memory_order_relaxed);
+      if (lo >= rawTotal || lo >= hyb->tail.load(std::memory_order_relaxed)) return false;
+    } else {
+      lo = cursor;
+      if (lo >= rawTotal) return false;
+      cursor += CHUNK_CAND;
     }
-    if (attemptsOut) *attemptsOut = attempted;
-    return 1; // GPU 侧完毕(跑完/被 CPU 命中叫停/进入 CPU 区),未命中
-  }
+    out.rawLo = lo;
+    out.rawHi = lo + CHUNK_CAND < rawTotal ? lo + CHUNK_CAND : rawTotal;
+    out.packedLo = out.rawLo;
+    out.packedHi = out.rawHi;
+    if (rawMap) {
+      out.packedLo = (uint64_t)(std::lower_bound(rawMap->begin(), rawMap->end(),
+                                                 (size_t)out.rawLo) - rawMap->begin());
+      out.packedHi = (uint64_t)(std::lower_bound(rawMap->begin(), rawMap->end(),
+                                                 (size_t)out.rawHi) - rawMap->begin());
+    }
+    return true;
+  };
 
-  uint64_t done = 0;
-  for (uint64_t base = 0; base < total; base += CHUNK_CAND) {
-    size_t cand = (size_t)(total - base < CHUNK_CAND ? total - base : CHUNK_CAND);
-    e = p_clSetKernelArg(k, baseArgIdx, sizeof(uint64_t), &base);
-    if (e != CL_SUCCESS) { err = "设置 base 参数失败"; return -1; }
-    size_t offset = 0;
-    size_t gws = cand, lws = c.lws, *plws = nullptr;
-    if (lws) { // 显式 local size:global 向上取整,kernel 内 total 边界检查兜底
-      gws = (cand + lws - 1) / lws * lws;
-      plws = &lws;
+  std::vector<cl_event> pendingEvs;
+  auto finish = [&](int rc) {
+    if (pipe) p_clFinish(c.q2);
+    for (cl_event ev : pendingEvs) p_clReleaseEvent(ev);
+    return rc;
+  };
+  uint64_t attempted = 0;
+  auto fail = [&](const char* msg) {
+    if (hyb) hyb->stop.store(true, std::memory_order_relaxed);
+    if (attemptsOut) *attemptsOut = attempted;
+    err = msg;
+    return finish(-1);
+  };
+  auto prefetch = [&](const Chunk& ch, cl_event& ev) {
+    ev = nullptr;
+    if (!pipe || ch.packedHi == ch.packedLo) return CL_SUCCESS;
+    size_t off = (size_t)ch.packedLo * pipe->stride;
+    size_t bytes = (size_t)(ch.packedHi - ch.packedLo) * pipe->stride;
+    cl_int rc = p_clEnqueueCopyBuffer(c.q2, pipe->src, pipe->dst, off, off, bytes,
+                                      0, nullptr, &ev);
+    if (rc == CL_SUCCESS && ev) pendingEvs.push_back(ev);
+    return rc;
+  };
+
+  Chunk cur;
+  if (!claim(cur)) {
+    if (attemptsOut) *attemptsOut = 0;
+    return finish(1);
+  }
+  cl_event curEv = nullptr;
+  if (prefetch(cur, curEv) != CL_SUCCESS) return fail("字典上传 enqueue 失败");
+
+  for (;;) {
+    if (hyb && hyb->stop.load(std::memory_order_relaxed)) {
+      if (attemptsOut) *attemptsOut = attempted;
+      return finish(1);
     }
-    e = p_clEnqueueNDRangeKernel(c.q, k, 1, &offset, &gws, plws, 0, nullptr, nullptr);
-    if (e != CL_SUCCESS) { err = "enqueue 失败"; return -1; }
-    p_clFinish(c.q);
-    done += cand;
+    attempted += cur.rawHi - cur.rawLo;
+    bool ranKernel = cur.packedHi > cur.packedLo;
+    if (ranKernel) {
+      uint64_t pbase = cur.packedLo, ptotal = cur.packedHi;
+      if (p_clSetKernelArg(k, baseArgIdx, sizeof(uint64_t), &pbase) != CL_SUCCESS ||
+          p_clSetKernelArg(k, totalArgIdx, sizeof(uint64_t), &ptotal) != CL_SUCCESS)
+        return fail("设置分块参数失败");
+      size_t cnt = (size_t)(cur.packedHi - cur.packedLo);
+      size_t offset = 0, gws = cnt, lws = c.lws, *plws = nullptr;
+      if (lws) { gws = (cnt + lws - 1) / lws * lws; plws = &lws; }
+      e = p_clEnqueueNDRangeKernel(c.q, k, 1, &offset, &gws, plws,
+                                   curEv ? 1u : 0u, curEv ? &curEv : nullptr, nullptr);
+      if (e != CL_SUCCESS) return fail("enqueue 失败");
+    }
+
+    Chunk next;
+    cl_event nextEv = nullptr;
+    bool haveNext = false;
+    cl_int nextCopyRc = CL_SUCCESS;
+    if (pipe) {
+      haveNext = claim(next);
+      if (haveNext) nextCopyRc = prefetch(next, nextEv);
+    }
+    if (ranKernel) p_clFinish(c.q);
+
     auto now = clk::now();
-    if (now - lastPrint >= std::chrono::seconds(10)) { // 长任务进度(10s 一报)
+    if (now - lastPrint >= std::chrono::seconds(10)) {
       double el = std::chrono::duration<double>(now - t0).count();
       fprintf(stderr, "[~] 进度 %llu/%llu(%.1f%%),%.0fM/s\n",
-              (unsigned long long)done, (unsigned long long)total,
-              done * 100.0 / total, (el > 0 ? done / el : 0) / 1e6);
+              (unsigned long long)attempted, (unsigned long long)total,
+              attempted * 100.0 / total, (el > 0 ? attempted / el : 0) / 1e6);
       lastPrint = now;
     }
-    if (g_crackAbort.load(std::memory_order_relaxed)) return 1;
-    int64_t found = -1;
-    p_clEnqueueReadBuffer(c.q, foundBuf, CL_TRUE, 0, sizeof found, &found, 0, nullptr, nullptr);
-    if (found >= 0) {
-      foundIdx = (uint64_t)found;
-      return 0;
+    if (g_crackAbort.load(std::memory_order_relaxed)) {
+      if (hyb) hyb->stop.store(true, std::memory_order_relaxed);
+      if (attemptsOut) *attemptsOut = attempted;
+      return finish(1);
     }
+    if (ranKernel) {
+      int64_t found = -1;
+      p_clEnqueueReadBuffer(c.q, foundBuf, CL_TRUE, 0, sizeof found, &found, 0, nullptr, nullptr);
+      if (found >= 0) {
+        foundIdx = rawMap ? (uint64_t)(*rawMap)[(size_t)found] : (uint64_t)found;
+        if (hyb) hyb->stop.store(true, std::memory_order_relaxed);
+        if (attemptsOut) *attemptsOut = attempted;
+        return finish(0);
+      }
+    }
+    if (nextCopyRc != CL_SUCCESS) return fail("字典上传 enqueue 失败");
+    if (!pipe) haveNext = claim(next);
+    if (!haveNext) {
+      if (attemptsOut) *attemptsOut = attempted;
+      return finish(1);
+    }
+    cur = next;
+    curEv = nextEv;
   }
-  return 1;
 }
 
 int gpuCrackMask(const GpuCrackParams& p, const std::vector<std::string>& pos, uint64_t total,
@@ -581,7 +678,14 @@ int gpuCrackMask(const GpuCrackParams& p, const std::vector<std::string>& pos, u
 
 int gpuCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, uint64_t count,
                  uint64_t& foundIdx, std::string& err, HybridCtl* hybrid,
-                 const std::vector<size_t>* rawMap, uint64_t* attemptsOut) {
+                 const std::vector<size_t>* rawMap, uint64_t* attemptsOut,
+                 OclHostBuf* pinned) {
+  size_t wordBytes = stride * (size_t)count;
+  bool usePinned = pinned && pinned->ptr == words && pinned->mem && pinned->size >= wordBytes;
+  struct PinnedGuard {
+    OclHostBuf* b;
+    ~PinnedGuard() { if (b) oclHostFree(*b); }
+  } pinnedGuard{usePinned ? pinned : nullptr};
   OclCtx& c = ocl();
   if (!c.ready) { err = c.error; return -1; }
   if (p.vlen > 512 || p.slen > 32) {
@@ -593,10 +697,20 @@ int gpuCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, u
   saltPc.init(p.salt, p.slen);
   valuePc.init(p.value, p.vlen);
   cl_int e = CL_SUCCESS;
+  auto tp0 = std::chrono::steady_clock::now();
   BufGuard bSaltTail, bValueTail, bWords, bFound;
   bSaltTail.m = makeRoBuf(c.ctx, saltPc.tailw.data(), saltPc.tailw.size() * 4, &e);
   bValueTail.m = makeRoBuf(c.ctx, valuePc.tailw.data(), valuePc.tailw.size() * 4, &e);
-  bWords.m = makeRoBuf(c.ctx, words, stride * count, &e);
+  if (usePinned) {
+    e = p_clEnqueueUnmapMemObject(c.q2, (cl_mem)pinned->mem, pinned->ptr,
+                                  0, nullptr, nullptr);
+    if (e != CL_SUCCESS) { err = "pinned 字典 unmap 失败"; return -1; }
+    p_clFinish(c.q2);
+    pinned->ptr = nullptr;
+    bWords.m = p_clCreateBuffer(c.ctx, CL_MEM_READ_ONLY, wordBytes, nullptr, &e);
+  } else {
+    bWords.m = makeRoBuf(c.ctx, words, wordBytes, &e);
+  }
   bFound.m = p_clCreateBuffer(c.ctx, CL_MEM_READ_WRITE, 8, nullptr, &e);
   if (!bSaltTail.m || !bValueTail.m || !bWords.m || !bFound.m) {
     err = "创建缓冲区失败(字典过大?)";
@@ -604,6 +718,11 @@ int gpuCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, u
   }
   int64_t neg = -1;
   p_clEnqueueWriteBuffer(c.q, bFound.m, CL_TRUE, 0, 8, &neg, 0, nullptr, nullptr);
+  if (getenv("ZK_PROF")) {
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+    fprintf(stderr, "[prof] dict 上传%s: %.1f ms(%.1f MB)\n",
+            usePinned ? "(pinned 准备)" : "(COPY_HOST_PTR)", ms, wordBytes / 1048576.0);
+  }
 
   cl_kernel k = c.kDict;
   uint32_t saltBlocks = (uint32_t)saltPc.tailBlocks();
@@ -619,5 +738,13 @@ int gpuCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, u
   p_clSetKernelArg(k, 9, sizeof(cl_mem), &bWords.m);
   p_clSetKernelArg(k, 10, 4, &ustride);
   p_clSetKernelArg(k, 13, sizeof(cl_mem), &bFound.m);
-  return runChunks(c, k, bFound.m, count, 11, 12, foundIdx, err, hybrid, rawMap, attemptsOut);
+  auto tk0 = std::chrono::steady_clock::now();
+  PipeUp pipe{(cl_mem)(usePinned ? pinned->mem : nullptr), bWords.m, stride};
+  int rc = runChunks(c, k, bFound.m, count, 11, 12, foundIdx, err, hybrid, rawMap,
+                     attemptsOut, usePinned ? &pipe : nullptr);
+  if (getenv("ZK_PROF")) {
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tk0).count();
+    fprintf(stderr, "[prof] dict kernel%s: %.1f ms\n", usePinned ? "+流水上传" : "", ms);
+  }
+  return rc;
 }

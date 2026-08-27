@@ -33,7 +33,7 @@ Bytecode Viewer - a lightweight user-friendly Java/Android Bytecode Viewer, Deco
 #### Key Features
 * Simply drag and drop to decompile and search Java Jars & Android APKs
 * File format support for: Class, Jar, APK, DEX, XAPK, APKM, WAR, JSP, Image Resources, Text Resources & More
-* 6 Built-in Java decompilers: Krakatau, CFR, Procyon, FernFlower, JADX, JD-GUI
+* 6 Built-in Java decompilers: Krakatau, CFR, Procyon, Vineflower, JADX, JD-GUI
 * 3 Built-in Bytecode disassemblers, including 2 assemblers: Krakatau and Smali/BakSmali
 * APK/DEX Support from Dex2Jar and Enjarify
 * Built-in Java Compiler

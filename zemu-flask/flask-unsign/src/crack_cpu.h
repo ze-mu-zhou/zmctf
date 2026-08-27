@@ -9,6 +9,10 @@
 #include <string>
 #include <vector>
 
+/** 批量验证回调:对 n 个候选逐个算 MAC(不提前退出),返回首个命中下标或 -1。
+ * 语义与单候选回调一致(同一 ctx),但允许实现用 SIMD 纵向多候选等手段加速。 */
+using VerifyBatchFn = int (*)(const uint8_t* const*, const size_t*, void*);
+
 /** 取消钩:置 true 后 CPU/GPU 爆破在批次/分块边界尽快退出(供 serve 模式的调用方取消;CLI 恒 false) */
 extern std::atomic<bool> g_crackAbort;
 
@@ -31,15 +35,19 @@ struct CrackResult {
  * verify(key, keyLen) 返回 true 即命中(内部完成派生+HMAC 比对)。
  */
 CrackResult crackCpuWordlist(const std::string& wordlistPath, int threads,
-                             bool (*verify)(const uint8_t*, size_t, void*), void* ctx);
+                             bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
+                             VerifyBatchFn verifyBatch = nullptr, int batchSize = 0);
 
 /** CPU 字典爆破(字典已在内存:与 GPU 打包共用一次加载,免二次读盘) */
 CrackResult crackCpuWords(const std::vector<std::string>& words, int threads,
-                          bool (*verify)(const uint8_t*, size_t, void*), void* ctx);
+                          bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
+                          VerifyBatchFn verifyBatch = nullptr, int batchSize = 0);
 
-/** CPU 掩码爆破:组合空间按块分配给线程 */
+/** CPU 掩码爆破:组合空间按块分配给线程。
+ *  verifyBatch/batchSize 提供时(SIMD 可用)热路径走批量验证,否则纯标量。 */
 CrackResult crackCpuMask(const std::vector<std::string>& pos, int threads,
-                         bool (*verify)(const uint8_t*, size_t, void*), void* ctx);
+                         bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
+                         VerifyBatchFn verifyBatch = nullptr, int batchSize = 0);
 
 /**
  * 混合(CPU+GPU)爆破共享控制块:GPU 从 head 升序吃块,CPU 从 tail 降序吃块,
@@ -54,9 +62,11 @@ struct HybridCtl {
 /** 掩码混合模式:CPU 只处理 [head, tail) 内的块,命中置 ctl.stop */
 CrackResult crackCpuMaskRange(const std::vector<std::string>& pos, int threads,
                               bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
-                              HybridCtl& ctl);
+                              HybridCtl& ctl,
+                              VerifyBatchFn verifyBatch = nullptr, int batchSize = 0);
 
 /** 字典混合模式:同上,序号空间为 words 下标(含 GPU 打包跳过的超长词) */
 CrackResult crackCpuWordsRange(const std::vector<std::string>& words, int threads,
                                bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
-                               HybridCtl& ctl);
+                               HybridCtl& ctl,
+                               VerifyBatchFn verifyBatch = nullptr, int batchSize = 0);

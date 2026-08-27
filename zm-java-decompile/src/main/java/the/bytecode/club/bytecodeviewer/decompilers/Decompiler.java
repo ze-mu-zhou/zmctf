@@ -33,7 +33,7 @@ public enum Decompiler
     NONE(null),
     PROCYON_DECOMPILER(new ProcyonDecompiler()),                //java decompiler
     CFR_DECOMPILER(new CFRDecompiler()),                        //java decompiler
-    FERNFLOWER_DECOMPILER(new FernFlowerDecompiler()),          //java decompiler
+    VINEFLOWER_DECOMPILER(new VineflowerDecompiler()),          //java decompiler
 
     BYTECODE_DISASSEMBLER(new BytecodeDisassembler()),          //bytecode disassembler
     HEXCODE_VIEWER(null),                                       //hexcode viewer

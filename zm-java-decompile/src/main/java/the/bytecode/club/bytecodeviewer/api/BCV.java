@@ -395,13 +395,25 @@ public class BCV
     }
 
     /**
-     * Returns the wrapped FernFlower Decompiler instance.
+     * Returns the wrapped Vineflower Decompiler instance.
      *
-     * @return The wrapped FernFlower Decompiler instance
+     * @return The wrapped Vineflower Decompiler instance
      */
+    public static AbstractDecompiler getVineflowerDecompiler()
+    {
+        return Decompiler.VINEFLOWER_DECOMPILER.getDecompiler();
+    }
+
+    /**
+     * Returns the wrapped Vineflower Decompiler instance.
+     *
+     * @return The wrapped Vineflower Decompiler instance
+     * @deprecated use {@link #getVineflowerDecompiler()} instead
+     */
+    @Deprecated
     public static AbstractDecompiler getFernFlowerDecompiler()
     {
-        return Decompiler.FERNFLOWER_DECOMPILER.getDecompiler();
+        return getVineflowerDecompiler();
     }
 
     /**

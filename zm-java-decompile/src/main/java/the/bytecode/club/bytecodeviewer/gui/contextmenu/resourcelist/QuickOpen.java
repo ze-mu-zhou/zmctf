@@ -39,7 +39,7 @@ public class QuickOpen extends ContextMenuItem
             JMenu quickOpen = new JMenu(TranslatedStrings.QUICK_OPEN.toString());
             quickOpen.add(createMenu(TranslatedStrings.PROCYON.toString(), () -> BytecodeViewer.viewer.resourcePane.quickDecompile(Decompiler.PROCYON_DECOMPILER, selPath, false)));
             quickOpen.add(createMenu(TranslatedStrings.CFR.toString(), () -> BytecodeViewer.viewer.resourcePane.quickDecompile(Decompiler.CFR_DECOMPILER, selPath, false)));
-            quickOpen.add(createMenu(TranslatedStrings.FERNFLOWER.toString(), () -> BytecodeViewer.viewer.resourcePane.quickDecompile(Decompiler.FERNFLOWER_DECOMPILER, selPath, false)));
+            quickOpen.add(createMenu(TranslatedStrings.VINEFLOWER.toString(), () -> BytecodeViewer.viewer.resourcePane.quickDecompile(Decompiler.VINEFLOWER_DECOMPILER, selPath, false)));
             quickOpen.add(createMenu(TranslatedStrings.KRAKATAU.toString(), () -> BytecodeViewer.viewer.resourcePane.quickDecompile(Decompiler.KRAKATAU_DECOMPILER, selPath, false)));
             quickOpen.add(createMenu(TranslatedStrings.BYTECODE.toString(), () -> BytecodeViewer.viewer.resourcePane.quickDecompile(Decompiler.BYTECODE_DISASSEMBLER, selPath, false)));
             menu.add(quickOpen);

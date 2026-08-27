@@ -47,7 +47,7 @@ public class DecompilerSelectionPane
     private final JRadioButtonMenuItem none = new TranslatedJRadioButtonMenuItem("None", TranslatedComponents.NONE);
     private final JRadioButtonMenuItem hexcodeViewer = new TranslatedJRadioButtonMenuItem("Hexcode", TranslatedComponents.HEXCODE);
     //decompilers
-    private final DecompilerViewComponent fernFlowerDecompiler = new DecompilerViewComponent("FernFlower", JAVA, Decompiler.FERNFLOWER_DECOMPILER);
+    private final DecompilerViewComponent vineflowerDecompiler = new DecompilerViewComponent("Vineflower", JAVA, Decompiler.VINEFLOWER_DECOMPILER);
     private final DecompilerViewComponent procyonDecompiler = new DecompilerViewComponent("Procyon", JAVA, Decompiler.PROCYON_DECOMPILER);
     private final DecompilerViewComponent CFRDecompiler = new DecompilerViewComponent("CFR", JAVA, Decompiler.CFR_DECOMPILER);
     private final DecompilerViewComponent JADXDecompiler = new DecompilerViewComponent("JADX", JAVA, Decompiler.JADX_DECOMPILER);
@@ -63,7 +63,7 @@ public class DecompilerSelectionPane
     //TODO when adding new decompilers insert the DecompilerViewComponent object into here
     // also in the group, then finally the build menu
     public List<DecompilerViewComponent> components = new ArrayList<>(Arrays.asList(
-        procyonDecompiler, CFRDecompiler, JADXDecompiler, JDCoreDecompiler, fernFlowerDecompiler,
+        procyonDecompiler, CFRDecompiler, JADXDecompiler, JDCoreDecompiler, vineflowerDecompiler,
         krakatauDecompiler, smaliDisassembler, bytecodeViewer, asmifierCodeGen, javapDisassembler));
 
     public DecompilerSelectionPane(int paneID)
@@ -87,7 +87,7 @@ public class DecompilerSelectionPane
         switch (paneID)
         {
             case 1:
-                group.setSelected(fernFlowerDecompiler.getJava().getModel(), true);
+                group.setSelected(vineflowerDecompiler.getJava().getModel(), true);
                 break;
             case 2:
                 group.setSelected(bytecodeViewer.getBytecode().getModel(), true);
@@ -151,7 +151,7 @@ public class DecompilerSelectionPane
             menu.add(JADXDecompiler.getMenu());
 
         menu.add(JDCoreDecompiler.getMenu());
-        menu.add(fernFlowerDecompiler.getMenu());
+        menu.add(vineflowerDecompiler.getMenu());
         menu.add(krakatauDecompiler.getMenu());
         menu.add(new JSeparator());
 

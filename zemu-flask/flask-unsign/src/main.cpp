@@ -341,7 +341,8 @@ static int cmdInteractive() {
   return 0;
 }
 
-int main(int argc, char** argv) {
+/** 实际入口(UTF-8 argv 已就绪),平台差异在下方薄壳层消化 */
+static int runMain(int argc, char** argv) {
   enableVtColors();
   if (argc >= 2 && std::string(argv[1]) == "serve") return cmdServe();
   if (argc >= 2) {
@@ -359,3 +360,35 @@ int main(int argc, char** argv) {
   }
   return runCommand(argc, argv);
 }
+
+#ifdef _WIN32
+
+/** UTF-16 → UTF-8(wmain 的 argv 是宽字符;窄字符 main 拿到的是 ANSI 码页字节,
+ *  中文系统下非 ASCII 参数会被 GBK 化,HMAC 密钥/JSON/salt 全部失配) */
+static std::string utf8FromWide(const wchar_t* ws) {
+  int n = WideCharToMultiByte(CP_UTF8, 0, ws, -1, nullptr, 0, nullptr, nullptr);
+  std::string s((size_t)(n > 0 ? n : 0), '\0');
+  if (n > 0) {
+    WideCharToMultiByte(CP_UTF8, 0, ws, -1, s.data(), n, nullptr, nullptr);
+    s.resize((size_t)n - 1); // 去掉 WideCharToMultiByte 写入的结尾 NUL
+  }
+  return s;
+}
+
+int wmain(int argc, wchar_t** argv) {
+  // 控制台切 UTF-8:交互模式键入与彩色中文提示在真实控制台不再乱码;
+  // 输出重定向到管道时无影响(管道本就按原始字节收发)
+  SetConsoleCP(CP_UTF8);
+  SetConsoleOutputCP(CP_UTF8);
+  std::vector<std::string> args((size_t)argc);
+  for (int i = 0; i < argc; i++) args[(size_t)i] = utf8FromWide(argv[i]);
+  std::vector<char*> argp((size_t)argc);
+  for (int i = 0; i < argc; i++) argp[(size_t)i] = args[(size_t)i].data();
+  return runMain(argc, argp.data());
+}
+
+#else
+
+int main(int argc, char** argv) { return runMain(argc, argv); }
+
+#endif

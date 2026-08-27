@@ -24,7 +24,7 @@ public class ListCommand extends CLICommand
             "==BCV CLI Decompilers==",
             "Procyon",
             "CFR",
-            "FernFlower",
+            "Vineflower",
             "Krakatau",
             "Krakatau-Bytecode",
             "JD-GUI",

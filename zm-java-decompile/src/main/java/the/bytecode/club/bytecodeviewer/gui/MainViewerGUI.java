@@ -181,10 +181,10 @@ public class MainViewerGUI extends JFrame
     public JCheckBoxMenuItem debugHelpers = new TranslatedJCheckBoxMenuItem("Debug Helpers", TranslatedComponents.DEBUG_HELPERS);
     public final JCheckBoxMenuItem printLineNumbers = new TranslatedJCheckBoxMenuItem("Print Line Numbers", TranslatedComponents.PRINT_LINE_NUMBERS);
 
-    //FernFlower settings
-    public final JMenu fernFlowerSettingsSecondaryMenu = new TranslatedJMenu("FernFlower Settings", TranslatedComponents.FERNFLOWER_SETTINGS);
-    public final JMenuItem fernFlowerSettings = new TranslatedJMenuItem("FernFlower Settings", TranslatedComponents.FERNFLOWER_SETTINGS);
-    public SettingsDialog fernFlowerSettingsDialog;
+    //Vineflower settings
+    public final JMenu vineflowerSettingsSecondaryMenu = new TranslatedJMenu("Vineflower Settings", TranslatedComponents.VINEFLOWER_SETTINGS);
+    public final JMenuItem vineflowerSettings = new TranslatedJMenuItem("Vineflower Settings", TranslatedComponents.VINEFLOWER_SETTINGS);
+    public SettingsDialog vineflowerSettingsDialog;
     public TranslatedJCheckBoxMenuItem rbr = new TranslatedJCheckBoxMenuItem("Hide bridge methods", TranslatedComponents.HIDE_BRIDGE_METHODS);
     public TranslatedJCheckBoxMenuItem rsy = new TranslatedJCheckBoxMenuItem("Hide synthetic class members", TranslatedComponents.HIDE_SYNTHETIC_CLASS_MEMBERS);
     public TranslatedJCheckBoxMenuItem din = new TranslatedJCheckBoxMenuItem("Decompile inner classes", TranslatedComponents.DECOMPILE_INNER_CLASSES);
@@ -605,29 +605,29 @@ public class MainViewerGUI extends JFrame
         cfrSettingsDialog = new SettingsDialog(cfrSettingsSecondaryMenu, new JPanel());
         cfrSettings.addActionListener((e) -> cfrSettingsDialog.showDialog());
 
-        //FERNFLOWER SETTINGS
-        settingsMainMenu.add(useNewSettingsDialog ? fernFlowerSettings : fernFlowerSettingsSecondaryMenu);
-        fernFlowerSettingsSecondaryMenu.add(ren);
-        fernFlowerSettingsSecondaryMenu.add(dc4);
-        fernFlowerSettingsSecondaryMenu.add(nns);
-        fernFlowerSettingsSecondaryMenu.add(ner);
-        fernFlowerSettingsSecondaryMenu.add(bto);
-        fernFlowerSettingsSecondaryMenu.add(rgn);
-        fernFlowerSettingsSecondaryMenu.add(rer);
-        fernFlowerSettingsSecondaryMenu.add(rbr);
-        fernFlowerSettingsSecondaryMenu.add(rsy);
-        fernFlowerSettingsSecondaryMenu.add(hes);
-        fernFlowerSettingsSecondaryMenu.add(hdc);
-        fernFlowerSettingsSecondaryMenu.add(din);
-        fernFlowerSettingsSecondaryMenu.add(das);
-        fernFlowerSettingsSecondaryMenu.add(dgs);
-        fernFlowerSettingsSecondaryMenu.add(den);
-        fernFlowerSettingsSecondaryMenu.add(uto);
-        fernFlowerSettingsSecondaryMenu.add(udv);
-        fernFlowerSettingsSecondaryMenu.add(fdi);
-        fernFlowerSettingsSecondaryMenu.add(asc);
-        fernFlowerSettingsDialog = new SettingsDialog(fernFlowerSettingsSecondaryMenu, new JPanel());
-        fernFlowerSettings.addActionListener((e) -> fernFlowerSettingsDialog.showDialog());
+        //VINEFLOWER SETTINGS
+        settingsMainMenu.add(useNewSettingsDialog ? vineflowerSettings : vineflowerSettingsSecondaryMenu);
+        vineflowerSettingsSecondaryMenu.add(ren);
+        vineflowerSettingsSecondaryMenu.add(dc4);
+        vineflowerSettingsSecondaryMenu.add(nns);
+        vineflowerSettingsSecondaryMenu.add(ner);
+        vineflowerSettingsSecondaryMenu.add(bto);
+        vineflowerSettingsSecondaryMenu.add(rgn);
+        vineflowerSettingsSecondaryMenu.add(rer);
+        vineflowerSettingsSecondaryMenu.add(rbr);
+        vineflowerSettingsSecondaryMenu.add(rsy);
+        vineflowerSettingsSecondaryMenu.add(hes);
+        vineflowerSettingsSecondaryMenu.add(hdc);
+        vineflowerSettingsSecondaryMenu.add(din);
+        vineflowerSettingsSecondaryMenu.add(das);
+        vineflowerSettingsSecondaryMenu.add(dgs);
+        vineflowerSettingsSecondaryMenu.add(den);
+        vineflowerSettingsSecondaryMenu.add(uto);
+        vineflowerSettingsSecondaryMenu.add(udv);
+        vineflowerSettingsSecondaryMenu.add(fdi);
+        vineflowerSettingsSecondaryMenu.add(asc);
+        vineflowerSettingsDialog = new SettingsDialog(vineflowerSettingsSecondaryMenu, new JPanel());
+        vineflowerSettings.addActionListener((e) -> vineflowerSettingsDialog.showDialog());
 
         //CFIDE SETTINGS
         settingsMainMenu.add(useNewSettingsDialog ? bytecodeDecompilerSettings : bytecodeDecompilerSettingsSecondaryMenu);
@@ -766,7 +766,7 @@ public class MainViewerGUI extends JFrame
         forceTurningIFs.setSelected(true);
         forLoopAGGCapture.setSelected(true);
 
-        // fernflower
+        // vineflower
         rbr.setSelected(true);
         rsy.setSelected(false);
         din.setSelected(true);

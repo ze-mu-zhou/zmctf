@@ -39,6 +39,9 @@ inline std::string b64urlEncode(const uint8_t* d, size_t n) {
 
 inline bool b64urlDecode(std::string_view s, std::vector<uint8_t>& out) {
   static constexpr auto tbl = b64detail::makeDecodeTable();
+  out.clear();
+  // Unpadded Base64 cannot have a single trailing character.
+  if ((s.size() & 3u) == 1u) return false;
   uint32_t acc = 0;
   int nbits = 0;
   for (char ch : s) {
@@ -50,6 +53,11 @@ inline bool b64urlDecode(std::string_view s, std::vector<uint8_t>& out) {
       nbits -= 8;
       out.push_back((uint8_t)(acc >> nbits));
     }
+  }
+  // Unused trailing bits must be zero for a canonical encoding.
+  if (nbits && (acc & ((1u << nbits) - 1u)) != 0) {
+    out.clear();
+    return false;
   }
   return true;
 }

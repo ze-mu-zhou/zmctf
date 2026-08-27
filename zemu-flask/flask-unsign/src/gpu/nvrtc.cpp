@@ -13,7 +13,14 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#ifdef _WIN32
 #include <windows.h>
+using LibHandle = HMODULE;
+#else
+#include <dlfcn.h>
+#include <unistd.h>
+using LibHandle = void*;
+#endif
 
 /* ---------- CUDA Driver API / NVRTC API 子集声明 ---------- */
 using CUresult = int;
@@ -39,6 +46,8 @@ CU_FN(CUresult, cuCtxCreate, (CUcontext*, unsigned, CUdevice));
 CU_FN(CUresult, cuCtxSetCurrent, (CUcontext));
 CU_FN(CUresult, cuMemAlloc, (CUdeviceptr*, size_t));
 CU_FN(CUresult, cuMemFree, (CUdeviceptr));
+CU_FN(CUresult, cuMemAllocHost, (void**, size_t));
+CU_FN(CUresult, cuMemFreeHost, (void*));
 CU_FN(CUresult, cuMemcpyHtoD, (CUdeviceptr, const void*, size_t));
 CU_FN(CUresult, cuMemcpyDtoH, (void*, CUdeviceptr, size_t));
 CU_FN(CUresult, cuModuleLoadData, (CUmodule*, const void*));
@@ -70,7 +79,8 @@ struct CudaCtx {
   CUfunction kDict = nullptr;
 };
 
-static HMODULE loadNvrtc() {
+static LibHandle loadNvrtc() {
+#ifdef _WIN32
   // NVRTC 的 DLL 名带 CUDA 大版本号,逐一尝试;PATH 找不到时退到 CUDA_PATH
   static const char* names[] = {
     "nvrtc64_130_0.dll", "nvrtc64_120_0.dll", "nvrtc64_110_0.dll", "nvrtc64.dll", nullptr
@@ -87,20 +97,52 @@ static HMODULE loadNvrtc() {
     }
   }
   return nullptr;
+#else
+  static const char* names[] = {
+    "libnvrtc.so", "libnvrtc.so.12", "libnvrtc.so.11", nullptr
+  };
+  for (int i = 0; names[i]; i++) {
+    if (LibHandle h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL)) return h;
+  }
+  if (const char* cp = getenv("CUDA_PATH")) {
+    for (int i = 0; names[i]; i++) {
+      std::string p = std::string(cp) + "/lib64/" + names[i];
+      if (LibHandle h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL)) return h;
+    }
+  }
+  return nullptr;
+#endif
 }
 
 static bool loadApis(std::string& err) {
-  static HMODULE cudaDll = [] { return LoadLibraryA("nvcuda.dll"); }();
-  static HMODULE rtcDll = loadNvrtc();
-  if (!cudaDll) { err = "nvcuda.dll 加载失败(无 NVIDIA 驱动?)"; return false; }
+#ifdef _WIN32
+  static LibHandle cudaDll = [] { return LoadLibraryA("nvcuda.dll"); }();
+#else
+  static LibHandle cudaDll = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+#endif
+  static LibHandle rtcDll = loadNvrtc();
+  if (!cudaDll) {
+#ifdef _WIN32
+    err = "nvcuda.dll 加载失败(无 NVIDIA 驱动?)";
+#else
+    err = "libcuda.so.1 加载失败(无 NVIDIA 驱动?)";
+#endif
+    return false;
+  }
   if (!rtcDll) { err = "NVRTC 未找到(未安装 CUDA Toolkit)"; return false; }
   bool ok = true;
+#ifdef _WIN32
 #define RESOLVE(dll, name) \
   if (!p_##name) { p_##name = (PFN_##name)(void*)GetProcAddress(dll, #name); ok = ok && p_##name; }
+#else
+#define RESOLVE(dll, name) \
+  if (!p_##name) { p_##name = (PFN_##name)dlsym(dll, #name); ok = ok && p_##name; }
+#endif
   RESOLVE(cudaDll, cuInit) RESOLVE(cudaDll, cuDeviceGet) RESOLVE(cudaDll, cuDeviceGetName)
   RESOLVE(cudaDll, cuDeviceGetAttribute) RESOLVE(cudaDll, cuDevicePrimaryCtxRetain)
   RESOLVE(cudaDll, cuCtxCreate)
   RESOLVE(cudaDll, cuCtxSetCurrent) RESOLVE(cudaDll, cuMemAlloc) RESOLVE(cudaDll, cuMemFree)
+  RESOLVE(cudaDll, cuMemAllocHost) RESOLVE(cudaDll, cuMemFreeHost)
   RESOLVE(cudaDll, cuMemcpyHtoD) RESOLVE(cudaDll, cuMemcpyDtoH) RESOLVE(cudaDll, cuModuleLoadData)
   RESOLVE(cudaDll, cuModuleGetFunction) RESOLVE(cudaDll, cuLaunchKernel) RESOLVE(cudaDll, cuCtxSynchronize)
   RESOLVE(cudaDll, cuFuncGetAttribute)
@@ -134,10 +176,18 @@ static CudaCtx& cuda() {
   int major = 0, minor = 0;
   p_cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, c.dev);
   p_cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, c.dev);
+#ifdef _WIN32
   if (p_cuDevicePrimaryCtxRetain(&c.ctx, c.dev) != CUDA_SUCCESS || !c.ctx) {
     c.error = "获取 primary context 失败";
     return c;
   }
+#else
+  // Linux 新版驱动上 primary context 可能被容器/持久化服务占用，直接创建独立 context。
+  if (p_cuCtxCreate(&c.ctx, 0, c.dev) != CUDA_SUCCESS || !c.ctx) {
+    c.error = "创建 CUDA context 失败";
+    return c;
+  }
+#endif
   {
     CUresult cr = p_cuCtxSetCurrent(c.ctx);
     // 自检:context 当前化后立刻试分配 8 字节,失败则改用自建 context
@@ -173,11 +223,20 @@ static CudaCtx& cuda() {
   // 文件格式:[u32 magic][u32 keyLen][key(devName|arch)][cubin]
   const uint32_t CACHE_MAGIC = 0x5A4B4302; // "ZKC" v2(tail 预转大端字 + expect 按值传参)
   std::string key = c.deviceName + "|" + arch;
+  std::string cachePath;
+#ifdef _WIN32
   char exePath[MAX_PATH] = {0};
   GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-  std::string cachePath = exePath;
+  cachePath = exePath;
   size_t slash = cachePath.find_last_of("\\/");
   cachePath = (slash == std::string::npos ? "." : cachePath.substr(0, slash)) + "\\flask_crack_nvrtc.bin";
+#else
+  char exePath[4096] = {0};
+  ssize_t n = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+  cachePath.assign(n > 0 ? exePath : ".");
+  size_t slash = cachePath.find_last_of('/');
+  cachePath = (slash == std::string::npos ? "." : cachePath.substr(0, slash)) + "/flask_crack_nvrtc.bin";
+#endif
 
   std::vector<uint8_t> cubin;
   if (FILE* f = fopen(cachePath.c_str(), "rb")) {
@@ -284,6 +343,23 @@ static CUdeviceptr cuAlloc(const void* data, size_t n, CUresult* rc) {
   return d;
 }
 
+CudaHostBuf cudaHostAlloc(size_t bytes) {
+  CudaHostBuf r;
+  if (bytes == 0) return r;
+  CudaCtx& c = cuda();
+  if (!c.ready) return r;
+  void* p = nullptr;
+  if (p_cuMemAllocHost(&p, bytes) != CUDA_SUCCESS || !p) return r;
+  r.ptr = p;
+  r.size = bytes;
+  return r;
+}
+
+void cudaHostFree(CudaHostBuf& b) {
+  if (b.ptr) p_cuMemFreeHost(b.ptr);
+  b = CudaHostBuf();
+}
+
 #define CHUNK_CAND (1ULL << 24) // 与 OpenCL 后端同基准
 
 int cudaCrackMask(const GpuCrackParams& p, const std::vector<std::string>& pos, uint64_t total,
@@ -365,7 +441,13 @@ int cudaCrackMask(const GpuCrackParams& p, const std::vector<std::string>& pos, 
 }
 
 int cudaCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, uint64_t count,
-                  uint64_t& foundIdx, std::string& err) {
+                  uint64_t& foundIdx, std::string& err, CudaHostBuf* pinned) {
+  size_t wordBytes = stride * (size_t)count;
+  bool usePinned = pinned && pinned->ptr == words && pinned->size >= wordBytes;
+  struct PinnedGuard {
+    CudaHostBuf* b;
+    ~PinnedGuard() { if (b) cudaHostFree(*b); }
+  } pinnedGuard{usePinned ? pinned : nullptr};
   CudaCtx& c = cuda();
   if (!c.ready) { err = c.error; return -1; }
   if (p.vlen > 512 || p.slen > 32) {
@@ -381,7 +463,7 @@ int cudaCrackDict(const GpuCrackParams& p, const uint8_t* words, size_t stride, 
   CUresult arc = CUDA_SUCCESS;
   dSalt.p = cuAlloc(saltPc.tailw.data(), saltPc.tailw.size() * 4, &arc);
   dValue.p = cuAlloc(valuePc.tailw.data(), valuePc.tailw.size() * 4, &arc);
-  dWords.p = cuAlloc(words, stride * count, &arc);
+  dWords.p = cuAlloc(usePinned ? pinned->ptr : words, wordBytes, &arc);
   dFound.p = cuAlloc(nullptr, 8, &arc);
   if (!dSalt.p || !dValue.p || !dWords.p || !dFound.p) {
     err = std::string("设备内存分配失败(字典过大?): ") + cuErr(arc);

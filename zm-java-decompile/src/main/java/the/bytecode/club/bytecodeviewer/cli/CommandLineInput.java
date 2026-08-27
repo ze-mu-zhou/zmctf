@@ -103,7 +103,7 @@ public class CommandLineInput
             {
                 System.out.println("Procyon");
                 System.out.println("CFR");
-                System.out.println("FernFlower");
+                System.out.println("Vineflower");
                 System.out.println("Krakatau");
                 System.out.println("Krakatau-Bytecode");
                 System.out.println("JD-GUI");
@@ -181,7 +181,8 @@ public class CommandLineInput
                 if (decompiler != null
                     && !decompiler.equalsIgnoreCase("procyon")
                     && !decompiler.equalsIgnoreCase("cfr")
-                    && !decompiler.equalsIgnoreCase("fernflower")
+                    && !decompiler.equalsIgnoreCase("vineflower")
+                    && !decompiler.equalsIgnoreCase("fernflower") //legacy alias for vineflower
                     && !decompiler.equalsIgnoreCase("krakatau")
                     && !decompiler.equalsIgnoreCase("krakatau-bytecode")
                     && !decompiler.equalsIgnoreCase("jd-gui")
@@ -284,16 +285,16 @@ public class CommandLineInput
                     }
                 }
             }
-            else if (decompiler.equalsIgnoreCase("fernflower"))
+            else if (decompiler.equalsIgnoreCase("vineflower") || decompiler.equalsIgnoreCase("fernflower"))
             {
-                System.out.println("Decompiling " + input.getAbsolutePath() + " with FernFlower");
+                System.out.println("Decompiling " + input.getAbsolutePath() + " with Vineflower");
                 BytecodeViewer.openFiles(new File[]{input}, false);
 
                 Thread.sleep(5 * 1000);
 
                 if (target.equalsIgnoreCase("all"))
                 {
-                    Decompiler.FERNFLOWER_DECOMPILER.getDecompiler().decompileToZip(tempZip.getAbsolutePath(), output.getAbsolutePath());
+                    Decompiler.VINEFLOWER_DECOMPILER.getDecompiler().decompileToZip(tempZip.getAbsolutePath(), output.getAbsolutePath());
                 }
                 else
                 {
@@ -301,7 +302,7 @@ public class CommandLineInput
                     {
                         ClassNode cn = BytecodeViewer.blindlySearchForClassNode(target);
                         final ClassWriter cw = accept(cn);
-                        String contents = Decompiler.FERNFLOWER_DECOMPILER.getDecompiler().decompileClassNode(cn, cw.toByteArray());
+                        String contents = Decompiler.VINEFLOWER_DECOMPILER.getDecompiler().decompileClassNode(cn, cw.toByteArray());
                         DiskWriter.write(output.getAbsolutePath(), contents);
                     }
                     catch (Exception e)

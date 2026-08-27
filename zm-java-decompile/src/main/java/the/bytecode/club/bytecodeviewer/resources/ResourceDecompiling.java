@@ -45,14 +45,14 @@ public class ResourceDecompiling
     private static final int DECOMPILE_SAVE_ALL = 10;
     private static final int DECOMPILE_SAVE_ALL_PROCYON = 11;
     private static final int DECOMPILE_SAVE_ALL_CFR = 12;
-    private static final int DECOMPILE_SAVE_ALL_FERNFLOWER = 13;
+    private static final int DECOMPILE_SAVE_ALL_VINEFLOWER = 13;
     private static final int DECOMPILE_SAVE_ALL_KRAKATAU = 14;
     //TODO JDGUI,JADX
 
     private static final int DECOMPILE_OPENED_ONLY_ALL = 20;
     private static final int DECOMPILE_OPENED_ONLY_PROCYON = 21;
     private static final int DECOMPILE_OPENED_ONLY_CFR = 22;
-    private static final int DECOMPILE_OPENED_ONLY_FERNFLOWER = 23;
+    private static final int DECOMPILE_OPENED_ONLY_VINEFLOWER = 23;
     private static final int DECOMPILE_OPENED_ONLY_KRAKATAU = 24;
     //TODO JDGUI,JADX
 
@@ -110,8 +110,8 @@ public class ResourceDecompiling
                         //decompile using CFR
                         decompileSaveAll(Decompiler.CFR_DECOMPILER, temporaryTargetJar, outputZip, true);
 
-                        //decompile using fern
-                        decompileSaveAll(Decompiler.FERNFLOWER_DECOMPILER, temporaryTargetJar, outputZip, true);
+                        //decompile using vineflower
+                        decompileSaveAll(Decompiler.VINEFLOWER_DECOMPILER, temporaryTargetJar, outputZip, true);
 
                         //decompile using krakatau
                         decompileSaveAll(Decompiler.KRAKATAU_DECOMPILER, temporaryTargetJar, outputZip, true);
@@ -127,9 +127,9 @@ public class ResourceDecompiling
                         decompileSaveAll(Decompiler.CFR_DECOMPILER, temporaryTargetJar, outputZip, false);
                         break;
 
-                    case DECOMPILE_SAVE_ALL_FERNFLOWER:
-                        //decompile using fern
-                        decompileSaveAll(Decompiler.FERNFLOWER_DECOMPILER, temporaryTargetJar, outputZip, false);
+                    case DECOMPILE_SAVE_ALL_VINEFLOWER:
+                        //decompile using vineflower
+                        decompileSaveAll(Decompiler.VINEFLOWER_DECOMPILER, temporaryTargetJar, outputZip, false);
                         break;
 
                     case DECOMPILE_SAVE_ALL_KRAKATAU:
@@ -199,8 +199,8 @@ public class ResourceDecompiling
                         //decompile using cfr
                         decompileCurrentlyOpenedResource(Decompiler.CFR_DECOMPILER, file, true);
 
-                        //decompile using fernflower
-                        decompileCurrentlyOpenedResource(Decompiler.FERNFLOWER_DECOMPILER, file, true);
+                        //decompile using vineflower
+                        decompileCurrentlyOpenedResource(Decompiler.VINEFLOWER_DECOMPILER, file, true);
 
                         //decompile using krakatau
                         decompileCurrentlyOpenedResource(Decompiler.KRAKATAU_DECOMPILER, file, true);
@@ -216,9 +216,9 @@ public class ResourceDecompiling
                         decompileCurrentlyOpenedResource(Decompiler.CFR_DECOMPILER, file, false);
                         break;
 
-                    case DECOMPILE_OPENED_ONLY_FERNFLOWER:
-                        //decompile using fernflower
-                        decompileCurrentlyOpenedResource(Decompiler.FERNFLOWER_DECOMPILER, file, false);
+                    case DECOMPILE_OPENED_ONLY_VINEFLOWER:
+                        //decompile using vineflower
+                        decompileCurrentlyOpenedResource(Decompiler.VINEFLOWER_DECOMPILER, file, false);
                         break;
 
                     case DECOMPILE_OPENED_ONLY_KRAKATAU:
@@ -237,7 +237,7 @@ public class ResourceDecompiling
     public static int promptDecompilerUserSelect()
     {
         final JOptionPane pane = new JOptionPane("Which decompiler would you like to use?");
-        final Object[] options = new String[]{"All", "Procyon", "CFR", "Fernflower", "Krakatau", "Cancel"}; //TODO JDGUI,JADX
+        final Object[] options = new String[]{"All", "Procyon", "CFR", "Vineflower", "Krakatau", "Cancel"}; //TODO JDGUI,JADX
 
         pane.setOptions(options);
         final JDialog dialog = pane.createDialog(BytecodeViewer.viewer, "Bytecode Viewer - Select Decompiler");

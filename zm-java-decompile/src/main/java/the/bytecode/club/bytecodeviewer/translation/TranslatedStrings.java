@@ -47,7 +47,7 @@ public enum TranslatedStrings
     JAVA,
     PROCYON,
     CFR,
-    FERNFLOWER,
+    VINEFLOWER,
     KRAKATAU,
     JDGUI,
     JADX,

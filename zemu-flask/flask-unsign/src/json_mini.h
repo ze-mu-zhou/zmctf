@@ -106,6 +106,7 @@ struct JsonParser {
         }
         p++;
       } else {
+        if ((uint8_t)*p < 0x20) return false;
         out += *p++;
       }
     }

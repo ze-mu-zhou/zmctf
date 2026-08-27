@@ -138,7 +138,8 @@ public class BCVCommandLine
         if (decompiler != null
             && !decompiler.equalsIgnoreCase("procyon")
             && !decompiler.equalsIgnoreCase("cfr")
-            && !decompiler.equalsIgnoreCase("fernflower")
+            && !decompiler.equalsIgnoreCase("vineflower")
+            && !decompiler.equalsIgnoreCase("fernflower") //legacy alias for vineflower
             && !decompiler.equalsIgnoreCase("krakatau")
             && !decompiler.equalsIgnoreCase("krakatau-bytecode")
             && !decompiler.equalsIgnoreCase("jd-gui")

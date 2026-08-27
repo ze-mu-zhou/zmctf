@@ -130,16 +130,18 @@ static bool loadWords(const std::string& path, std::vector<std::string>& words, 
 }
 
 CrackResult crackCpuWordlist(const std::string& wordlistPath, int threads,
-                             bool (*verify)(const uint8_t*, size_t, void*), void* ctx) {
+                             bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
+                             VerifyBatchFn verifyBatch, int batchSize) {
   std::vector<std::string> words;
   CrackResult res;
   if (!loadWords(wordlistPath, words, res.error)) return res;
-  return crackCpuWords(words, threads, verify, ctx);
+  return crackCpuWords(words, threads, verify, ctx, verifyBatch, batchSize);
 }
 
 /** CPU 字典爆破(内存字典:与 GPU 路径共用一次加载,避免二次读盘) */
 CrackResult crackCpuWords(const std::vector<std::string>& words, int threads,
-                          bool (*verify)(const uint8_t*, size_t, void*), void* ctx) {
+                          bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
+                          VerifyBatchFn verifyBatch, int batchSize) {
   RunCtx rc;
   if (words.empty()) {
     CrackResult res;
@@ -149,26 +151,51 @@ CrackResult crackCpuWords(const std::vector<std::string>& words, int threads,
   std::atomic<size_t> idx{0};
   ProgressInl prog;
   prog.begin(words.size());
+  const int B = (verifyBatch && batchSize > 1) ? batchSize : 1; // 批量宽度
   return runPool(threads, words.size(), rc, prog, [&] {
     uint64_t local = 0;
-    // 先整批拷出再验证:拷贝遍是散射大字典的预取流水,验证遍打 L1 热数据;
-    // 实测去掉拷贝(直读 words[i])在 32 线程下慢 ~30%(访存延迟暴露),勿"优化"掉
-    std::vector<std::string> batch;
+    // 直读 words(不整批拷贝):标量时代拷贝曾当预取流水(32 线程 +30%),
+    // 批量验证快 8~16 倍后拷贝变成纯开销(长词实测直读 +40%),结论已反转
+    std::vector<const uint8_t*> bkeys((size_t)B); // 批量槽:直接指进 words
+    std::vector<size_t> bklen((size_t)B);
     while (!rc.found.load(std::memory_order_relaxed) &&
            !g_crackAbort.load(std::memory_order_relaxed)) {
       // 每线程每次领 1024 个,减少原子争抢
       size_t begin = idx.fetch_add(1024, std::memory_order_relaxed);
       if (begin >= words.size()) break;
       size_t end = begin + 1024 < words.size() ? begin + 1024 : words.size();
-      batch.clear();
-      for (size_t i = begin; i < end; i++) batch.push_back(words[i]);
-      for (const auto& cand : batch) {
+      const size_t m = end - begin;
+      const std::string* src = words.data() + begin; // 直读实验:跳过 batch 拷贝
+      for (size_t i = 0; i < m;) {
+        if (B > 1 && m - i >= (size_t)B) {
+          // —— 批量路径:一次 SIMD 验证 B 个变长候选 ——
+          for (int b = 0; b < B; b++) {
+            const std::string& w = src[i + (size_t)b];
+            bkeys[(size_t)b] = (const uint8_t*)w.data();
+            bklen[(size_t)b] = w.size();
+          }
+          int hit = verifyBatch(bkeys.data(), bklen.data(), ctx);
+          if (hit >= 0) {
+            local += (uint64_t)hit + 1;
+            bool expected = false;
+            if (rc.found.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+              rc.secret = src[i + (size_t)hit];
+            break;
+          }
+          local += (uint64_t)B;
+          i += (size_t)B;
+          continue;
+        }
+        // —— 标量路径:批尾余数 / 未启用批量 ——
         local++;
+        const std::string& cand = src[i];
         if (verify((const uint8_t*)cand.data(), cand.size(), ctx)) {
-          rc.secret = cand;
-          rc.found.store(true, std::memory_order_relaxed);
+          bool expected = false;
+          if (rc.found.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+            rc.secret = cand;
           break;
         }
+        i++;
       }
       rc.attempts.fetch_add(local, std::memory_order_relaxed);
       prog.tick(rc.attempts);
@@ -183,37 +210,85 @@ CrackResult crackCpuWords(const std::vector<std::string>& words, int threads,
 // CPU 侧领块粒度:太大则命中/取消的停止延迟高,太小则游标原子争抢;64K ≈ 0.6ms/线程
 static const uint64_t HYBRID_CHUNK = 65536;
 
+// 从尾部无下溢地领取一段区间;不足一个 chunk 时把 tail 钳到 0。
+static bool claimHybridTail(HybridCtl& ctl, uint64_t& start, uint64_t& end) {
+  uint64_t hi = ctl.tail.load(std::memory_order_relaxed);
+  while (hi != 0) {
+    uint64_t lo = hi > HYBRID_CHUNK ? hi - HYBRID_CHUNK : 0;
+    if (ctl.tail.compare_exchange_weak(hi, lo, std::memory_order_relaxed)) {
+      start = lo;
+      end = hi;
+      return true;
+    }
+  }
+  return false;
+}
+
 CrackResult crackCpuMaskRange(const std::vector<std::string>& pos, int threads,
                               bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
-                              HybridCtl& ctl) {
+                              HybridCtl& ctl,
+                              VerifyBatchFn verifyBatch, int batchSize) {
   CrackResult res;
-  uint64_t total = 1; // 与 flaskCrack 同式;tail 下溢检测的基准
-  for (const auto& cs : pos) total *= (uint64_t)cs.size();
   const size_t L = pos.size();
   RunCtx rc;
   ProgressInl prog;
   prog.on = false; // 混合模式进度由 GPU 侧统一汇报
+  const int B = (verifyBatch && batchSize > 1) ? batchSize : 1; // 批量宽度
   res = runPool(threads, 0, rc, prog, [&] {
     uint64_t local = 0;
     std::vector<uint32_t> idx(L); // 每位字符集下标(里程表)
     std::string cand(L, ' ');
+    // 批量流专用状态:每槽持有独立候选拷贝(与 crackCpuMask 批量段同构)
+    std::vector<std::string> bcand((size_t)B, std::string(L, ' '));
+    std::vector<const uint8_t*> bkeys((size_t)B);
+    std::vector<size_t> bklen((size_t)B);
     while (!ctl.stop.load(std::memory_order_relaxed) &&
            !rc.found.load(std::memory_order_relaxed) &&
            !g_crackAbort.load(std::memory_order_relaxed)) {
-      uint64_t end = ctl.tail.fetch_sub(HYBRID_CHUNK, std::memory_order_relaxed);
-      if (end > total) break; // 块粒度大于剩余空间时下溢回绕:空间已尽,退出
+      uint64_t start = 0, end = 0;
+      if (!claimHybridTail(ctl, start, end)) break;
       uint64_t h = ctl.head.load(std::memory_order_relaxed);
       if (end <= h) break; // 剩余空间已全被 GPU 认领
-      uint64_t start = end > HYBRID_CHUNK ? end - HYBRID_CHUNK : 0;
       if (start < h) start = h; // 与 GPU 认领区重叠部分丢弃:可能重复验,不会漏
       uint64_t v = start;
       for (size_t k = L; k-- > 0;) { idx[k] = (uint32_t)(v % pos[k].size()); v /= pos[k].size(); }
       for (size_t k = 0; k < L; k++) cand[k] = pos[k][idx[k]];
-      for (uint64_t i = start; i < end; i++) {
+      for (uint64_t i = start; i < end;) {
+        if (B > 1 && end - i >= (uint64_t)B) {
+          // 批量路径:槽位 b = 候选 i+b,先推进滚动源再整串拷入(顺序不能反)
+          for (int b = 0; b < B; b++) {
+            if (b > 0) {
+              for (size_t k = L; k-- > 0;) {
+                if (++idx[k] < pos[k].size()) { cand[k] = pos[k][idx[k]]; break; }
+                idx[k] = 0; cand[k] = pos[k][0];
+              }
+            }
+            bcand[(size_t)b] = cand;
+            bkeys[(size_t)b] = (const uint8_t*)bcand[(size_t)b].data(); bklen[(size_t)b] = L;
+          }
+          int hit = verifyBatch(bkeys.data(), bklen.data(), ctx);
+          if (hit >= 0) {
+            local += (uint64_t)hit + 1;
+            bool expected = false;
+            if (rc.found.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+              rc.secret = bcand[(size_t)hit];
+            ctl.stop.store(true, std::memory_order_relaxed);
+            break;
+          }
+          // 批内推进了 B-1 次;再进一位对齐下批起点 i+B
+          for (size_t k = L; k-- > 0;) {
+            if (++idx[k] < pos[k].size()) { cand[k] = pos[k][idx[k]]; break; }
+            idx[k] = 0; cand[k] = pos[k][0];
+          }
+          local += (uint64_t)B;
+          i += (uint64_t)B;
+          continue;
+        }
         local++;
         if (verify((const uint8_t*)cand.data(), cand.size(), ctx)) {
-          rc.secret = cand;
-          rc.found.store(true, std::memory_order_relaxed);
+          bool expected = false;
+          if (rc.found.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+            rc.secret = cand;
           ctl.stop.store(true, std::memory_order_relaxed);
           break;
         }
@@ -221,6 +296,7 @@ CrackResult crackCpuMaskRange(const std::vector<std::string>& pos, int threads,
           if (++idx[k] < pos[k].size()) { cand[k] = pos[k][idx[k]]; break; }
           idx[k] = 0; cand[k] = pos[k][0];
         }
+        i++;
       }
       rc.attempts.fetch_add(local, std::memory_order_relaxed);
       local = 0;
@@ -232,33 +308,57 @@ CrackResult crackCpuMaskRange(const std::vector<std::string>& pos, int threads,
 
 CrackResult crackCpuWordsRange(const std::vector<std::string>& words, int threads,
                                bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
-                               HybridCtl& ctl) {
+                               HybridCtl& ctl,
+                               VerifyBatchFn verifyBatch, int batchSize) {
   RunCtx rc;
   ProgressInl prog;
   prog.on = false;
-  const uint64_t N = (uint64_t)words.size(); // tail 下溢检测的基准
+  const int B = (verifyBatch && batchSize > 1) ? batchSize : 1; // 批量宽度
   return runPool(threads, 0, rc, prog, [&] {
     uint64_t local = 0;
-    std::vector<std::string> batch; // 同 crackCpuWords:拷贝遍是散射访存的预取流水,勿省
+    std::vector<const uint8_t*> bkeys((size_t)B); // 批量槽:直接指进 words
+    std::vector<size_t> bklen((size_t)B);
     while (!ctl.stop.load(std::memory_order_relaxed) &&
            !rc.found.load(std::memory_order_relaxed) &&
            !g_crackAbort.load(std::memory_order_relaxed)) {
-      uint64_t end = ctl.tail.fetch_sub(HYBRID_CHUNK, std::memory_order_relaxed);
-      if (end > N) break; // 块粒度大于剩余空间时下溢回绕:空间已尽,退出
+      uint64_t start = 0, end = 0;
+      if (!claimHybridTail(ctl, start, end)) break;
       uint64_t h = ctl.head.load(std::memory_order_relaxed);
       if (end <= h) break;
-      uint64_t start = end > HYBRID_CHUNK ? end - HYBRID_CHUNK : 0;
       if (start < h) start = h;
-      batch.clear();
-      for (uint64_t i = start; i < end; i++) batch.push_back(words[(size_t)i]);
-      for (const auto& cand : batch) {
+      const uint64_t m = end - start;
+      const std::string* src = words.data() + start; // 直读:批量时代拷贝纯亏(实测 -40% 长词)
+      for (uint64_t i = 0; i < m;) {
+        if (B > 1 && m - i >= (uint64_t)B) {
+          // 批量路径:一次 SIMD 验证 B 个变长候选
+          for (int b = 0; b < B; b++) {
+            const std::string& w = src[(size_t)(i + (uint64_t)b)];
+            bkeys[(size_t)b] = (const uint8_t*)w.data();
+            bklen[(size_t)b] = w.size();
+          }
+          int hit = verifyBatch(bkeys.data(), bklen.data(), ctx);
+          if (hit >= 0) {
+            local += (uint64_t)hit + 1;
+            bool expected = false;
+            if (rc.found.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+              rc.secret = src[(size_t)(i + (uint64_t)hit)];
+            ctl.stop.store(true, std::memory_order_relaxed);
+            break;
+          }
+          local += (uint64_t)B;
+          i += (uint64_t)B;
+          continue;
+        }
         local++;
+        const std::string& cand = src[(size_t)i];
         if (verify((const uint8_t*)cand.data(), cand.size(), ctx)) {
-          rc.secret = cand;
-          rc.found.store(true, std::memory_order_relaxed);
+          bool expected = false;
+          if (rc.found.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+            rc.secret = cand;
           ctl.stop.store(true, std::memory_order_relaxed);
           break;
         }
+        i++;
       }
       rc.attempts.fetch_add(local, std::memory_order_relaxed);
       local = 0;
@@ -268,7 +368,8 @@ CrackResult crackCpuWordsRange(const std::vector<std::string>& words, int thread
 }
 
 CrackResult crackCpuMask(const std::vector<std::string>& pos, int threads,
-                         bool (*verify)(const uint8_t*, size_t, void*), void* ctx) {
+                         bool (*verify)(const uint8_t*, size_t, void*), void* ctx,
+                         VerifyBatchFn verifyBatch, int batchSize) {
   CrackResult res;
   uint64_t total = 1;
   for (const auto& cs : pos) {
@@ -284,10 +385,17 @@ CrackResult crackCpuMask(const std::vector<std::string>& pos, int threads,
   RunCtx rc;
   ProgressInl prog;
   prog.begin(total);
+  const int B = (verifyBatch && batchSize > 1) ? batchSize : 1; // 批量宽度
   res = runPool(threads, total, rc, prog, [&] {
     uint64_t local = 0;
     std::vector<uint32_t> idx(L); // 每位字符集下标(里程表),进位递增替代逐候选除法链
     std::string cand(L, ' ');     // 定长候选缓冲,原地改写,无逐候选 string 构造
+
+    // 批量流专用状态:每槽持有独立候选拷贝(bkeys 必须各指各的)
+    std::vector<std::string> bcand((size_t)B, std::string(L, ' '));
+    std::vector<const uint8_t*> bkeys((size_t)B);
+    std::vector<size_t> bklen((size_t)B);
+
     while (!rc.found.load(std::memory_order_relaxed) &&
            !g_crackAbort.load(std::memory_order_relaxed)) {
       uint64_t start = base.fetch_add(CHUNK, std::memory_order_relaxed);
@@ -297,11 +405,43 @@ CrackResult crackCpuMask(const std::vector<std::string>& pos, int threads,
       uint64_t v = start;
       for (size_t k = L; k-- > 0;) { idx[k] = (uint32_t)(v % pos[k].size()); v /= pos[k].size(); }
       for (size_t k = 0; k < L; k++) cand[k] = pos[k][idx[k]];
-      for (uint64_t i = start; i < end; i++) {
+      for (uint64_t i = start; i < end;) {
+        if (B > 1 && end - i >= (uint64_t)B) {
+          // —— 批量路径:组装 B 个连续候选(先推进滚动源,再整串拷入槽位) ——
+          // 槽位 b 的内容必须等于候选 i+b:推进一步后再拷贝,顺序不能反
+          for (int b = 0; b < B; b++) {
+            if (b > 0) {
+              for (size_t k = L; k-- > 0;) {
+                if (++idx[k] < pos[k].size()) { cand[k] = pos[k][idx[k]]; break; }
+                idx[k] = 0; cand[k] = pos[k][0];
+              }
+            }
+            bcand[(size_t)b] = cand;
+            bkeys[(size_t)b] = (const uint8_t*)bcand[(size_t)b].data(); bklen[(size_t)b] = L;
+          }
+          int hit = verifyBatch(bkeys.data(), bklen.data(), ctx);
+          if (hit >= 0) {
+            local += (uint64_t)hit + 1;
+            bool expected = false;
+            if (rc.found.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+              rc.secret = bcand[(size_t)hit];
+            break;
+          }
+          // 批内推进了 B-1 次(cand=i+B-1);再进一位对齐下批起点 i+B
+          for (size_t k = L; k-- > 0;) {
+            if (++idx[k] < pos[k].size()) { cand[k] = pos[k][idx[k]]; break; }
+            idx[k] = 0; cand[k] = pos[k][0];
+          }
+          local += (uint64_t)B;
+          i += (uint64_t)B;
+          continue;
+        }
+        // —— 标量路径:块尾余数 / 未启用批量 ——
         local++;
         if (verify((const uint8_t*)cand.data(), cand.size(), ctx)) {
-          rc.secret = cand;
-          rc.found.store(true, std::memory_order_relaxed);
+          bool expected = false;
+          if (rc.found.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+            rc.secret = cand;
           break;
         }
         // 里程表进位:末位最快,绝大多数迭代 O(1)
@@ -309,6 +449,7 @@ CrackResult crackCpuMask(const std::vector<std::string>& pos, int threads,
           if (++idx[k] < pos[k].size()) { cand[k] = pos[k][idx[k]]; break; }
           idx[k] = 0; cand[k] = pos[k][0];
         }
+        i++;
       }
       rc.attempts.fetch_add(local, std::memory_order_relaxed);
       prog.tick(rc.attempts);

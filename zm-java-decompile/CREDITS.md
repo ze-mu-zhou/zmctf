@@ -4,7 +4,7 @@
 * RSynaxPane by Robert Futrell
 * Commons IO by Apache
 * ASM by OW2
-* FernFlower by Stiver
+* Vineflower by the Vineflower team (modern fork of FernFlower by Stiver)
 * Procyon by Mstrobel
 * Luyten by DeathMarine
 * CFR by Lee Benfield

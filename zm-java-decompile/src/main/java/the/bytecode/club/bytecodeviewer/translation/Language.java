@@ -30,8 +30,7 @@ import java.util.*;
 /**
  * All of the supported languages
  * <p>
- * TODO: Hindi, Bengali, Korean, Thai & Javanese need fonts to be supplied for them to show.
- *  The default font should be saved so it can be restored for latin-character based languages
+ * This fork only ships English (internal fallback) and Mandarin.
  *
  * @author Konloch
  * @since 6/28/2021
@@ -39,48 +38,7 @@ import java.util.*;
 public enum Language
 {
     ENGLISH("/translations/english.json", "English", "English", "en"),
-    ARABIC("/translations/arabic.json", "عربى", "English", "ar"),
-    CROATIAN("/translations/croatian.json", "hrvatski", "English", "hr"),
-    CZECH("/translations/czech.json", "čeština", "English", "cs"),
-    BULGARIAN("/translations/bulgarian.json", "български", "English", "bg"),
-    DANISH("/translations/danish.json", "dansk", "English", "da"),
-    ESTONIAN("/translations/estonian.json", "Eesti", "English", "et"),
-    FARSI("/translations/farsi.json", "فارسی ", "English", "fa"),
-    FINNISH("/translations/finnish.json", "Suomen Kieli", "English", "fi"),
-    FRENCH("/translations/french.json", "Français", "English", "fr"),
-    GERMAN("/translations/german.json", "Deutsch", "German", "de"),
-    GEORGIAN("/translations/georgian.json", "ქართული ენა", "English", "ka"),
-    GREEK("/translations/greek.json", "ελληνικά", "English", "el"),
-    HAUSA("/translations/hausa.json", "Hausa", "English", "ha"),
-    HEBREW("/translations/hebrew.json", "עִבְרִית\u200E", "English", "iw", "he"),
-    //HINDI("/translations/hindi.json", "हिंदी", "English", "hi"),
-    //BENGALI("/translations/bengali.json", "বাংলা", "English", "bn"),
-    HUNGARIAN("/translations/hungarian.json", "Magyar Nyelv", "English", "hu"),
-    INDONESIAN("/translations/indonesian.json", "bahasa Indonesia", "English", "id"),
-    ITALIAN("/translations/italian.json", "Italiano", "English", "it"),
-    JAPANESE("/translations/japanese.json", "日本語", "English", "ja"),
-    LATIVAN("/translations/lativan.json", "Lativan", "English", "lv"),
-    LITHUANIAN("/translations/lithuanian.json", "Lietuvių", "English", "lt"),
-    //JAVANESE("/translations/javanese.json", "ꦧꦱꦗꦮ", "English", "jw", "jv"),
-    //KOREAN("/translations/korean.json", "Korean", "English", "ko"),
-    MALAY("/translations/malay.json", "Bahasa Melayu", "English", "ms"),
     MANDARIN("/translations/mandarin.json", "普通话", "Mandarin", "zh-CN", "zh_cn", "zh"),
-    NEDERLANDS("/translations/nederlands.json", "Nederlands", "English", "nl"), //dutch
-    NORWEGIAN("/translations/norwegian.json", "Norsk", "English", "no"),
-    POLISH("/translations/polish.json", "Polski", "English", "pl"),
-    PORTUGUESE("/translations/portuguese.json", "Português", "English", "pt"),
-    ROMANIAN("/translations/romanian.json", "Română", "English", "ro"),
-    RUSSIAN("/translations/russian.json", "русский", "English", "ru"),
-    SLOVAK("/translations/slovak.json", "Slovensky", "English", "sk"),
-    SLOVENIAN("/translations/slovenian.json", "Slovenščina", "English", "sl"),
-    SPANISH("/translations/spanish.json", "Español", "English", "es"),
-    SERBIAN("/translations/serbian.json", "српски језик", "English", "sr"),
-    SWAHILI("/translations/swahili.json", "Kiswahili", "English", "sw"),
-    SWEDISH("/translations/swedish.json", "svenska", "English", "sv"),
-    //THAI("/translations/thai.json", "ภาษาไทย", "English", "th"),
-    TURKISH("/translations/turkish.json", "Türkçe", "English", "tr"),
-    UKRAINIAN("/translations/ukrainian.json", "украї́нська мо́ва", "English", "uk"),
-    VIETNAMESE("/translations/vietnamese.json", "Tiếng Việt", "English", "vi"),
     ;
 
     private static final Map<String, Language> languageCodeLookup;

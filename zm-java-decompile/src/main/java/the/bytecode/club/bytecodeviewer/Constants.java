@@ -48,7 +48,7 @@ public class Constants
     //the cons to this are:
     //      + If you could keep it in memory, now you need to write to disk (windows limitations)
     public static final boolean LAUNCH_DECOMPILERS_IN_NEW_PROCESS = false;  //TODO - work in progress
-                                                                            // FernFlower is added
+                                                                            // Vineflower is added
 
     //could be automatic by checking if it's loaded a class named whatever for a library
     //maybe it could be automatic with some maven plugin?

@@ -26,11 +26,13 @@ import hashlib
 import os
 import re
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 try:
     import aiohttp
@@ -77,7 +79,7 @@ SHA1_RE = re.compile(rb"\b[0-9a-f]{40}\b")
 HREF_RE = re.compile(r'href="([^"?#][^"]*)"')
 
 
-def run_git(args, cwd=None, gitdir=None, timeout=300):
+def run_git(args, cwd=None, gitdir=None, timeout=300, input_text=None):
     """统一的 git 调用: 强制 UTF-8 解码 (防中文 Windows GBK 崩溃), 永不返回 None
 
     安全约定: 对重建的仓库操作时必须传 gitdir (用 --git-dir 形式),
@@ -91,7 +93,7 @@ def run_git(args, cwd=None, gitdir=None, timeout=300):
         cmd += ["-C", cwd]
     cmd += args
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
+        r = subprocess.run(cmd, capture_output=True, text=True, input=input_text,
                            encoding="utf-8", errors="replace", timeout=timeout)
         return r.returncode, r.stdout or "", r.stderr or ""
     except (OSError, subprocess.TimeoutExpired):
@@ -152,6 +154,12 @@ TAG_NAMES = [
 # GitHub PR 引用 (refs/pull/N/head, refs/pull/N/merge)
 PULL_RANGE = 20
 
+# config 净化: 只从服务器 config 回捞白名单标量键, 其余整体丢弃
+# (防 core.fsmonitor / core.hooksPath / filter.* 等可执行键 RCE)
+SAFE_CONFIG_KEYS = ("core.repositoryformatversion", "core.filemode",
+                    "extensions.objectformat", "extensions.refstorage")
+SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
 # 协程并发上限 (单线程无栈开销, 可以给到很高)
 MAX_CONCURRENCY = min(512, max(64, (os.cpu_count() or 8) * 32))
 # 固定输出目录, 每次运行前覆盖
@@ -176,6 +184,65 @@ def build_ref_paths(extra_names=None, pull_range=PULL_RANGE):
     return paths
 
 
+def parse_headers(raw_list):
+    """解析 -H 自定义 header, 兼容 "Name: value" 和 "Name=value" 两种写法"""
+    headers = {}
+    for h in raw_list or []:
+        if ":" in h:
+            k, _, v = h.partition(":")
+        elif "=" in h:
+            k, _, v = h.partition("=")
+        else:
+            warn(f"忽略无法解析的 header: {h!r} (应为 Name: value 或 Name=value)")
+            continue
+        headers[k.strip()] = v.strip()
+    return headers
+
+
+def build_ssl_context(cert=None, key=None, p12=None, p12_password=None):
+    """客户端证书 (双向 TLS)。返回 (SSLContext, tmpdir, cert_pem, key_pem)。
+
+    始终不校验服务器证书 (靶场多为自签), 与旧版 ssl=False 行为一致;
+    cert_pem/key_pem 用于透传给智能协议的 git clone;
+    p12 解出的 PEM 私钥写入临时目录, 调用方负责用后删除。"""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    tmpdir = None
+    if p12:
+        try:
+            from cryptography.hazmat.primitives.serialization import (
+                Encoding, NoEncryption, PrivateFormat, pkcs12)
+        except ImportError:
+            err("--p12 需要 cryptography: pip install cryptography")
+            sys.exit(2)
+        if p12_password is None:
+            import getpass
+            p12_password = getpass.getpass("p12 密码 (可空直接回车): ")
+        try:
+            with open(p12, "rb") as f:
+                k, c, _ = pkcs12.load_key_and_certificates(
+                    f.read(), p12_password.encode() or None)
+        except Exception as e:
+            err(f"p12 解析失败: {e}")
+            sys.exit(2)
+        tmpdir = tempfile.mkdtemp(prefix="zm-git-cert-")
+        cert = os.path.join(tmpdir, "cert.pem")
+        with open(cert, "wb") as f:
+            f.write(c.public_bytes(Encoding.PEM))
+        if k is not None:
+            key = os.path.join(tmpdir, "key.pem")
+            with open(key, "wb") as f:
+                f.write(k.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    if cert:
+        try:
+            ctx.load_cert_chain(cert, key)
+        except (ssl.SSLError, OSError) as e:
+            err(f"客户端证书加载失败: {e}")
+            sys.exit(2)
+    return ctx, tmpdir, cert, key
+
+
 def normalize_url(raw):
     """宽松解析: 接受 127.0.0.1:1234 / site.com / site.com/.git / site.com/repo 等"""
     raw = raw.strip()
@@ -197,7 +264,8 @@ def normalize_url(raw):
 
 class Dumper:
     def __init__(self, url, outdir, concurrency=MAX_CONCURRENCY, proxy=None, timeout=10,
-                 use_git=True, crawl=True, brute=True, wordlist=None, pulls=PULL_RANGE):
+                 use_git=True, crawl=True, brute=True, wordlist=None, pulls=PULL_RANGE,
+                 headers=None, cert=None, key=None, p12=None, p12_password=None):
         self.candidates = normalize_url(url)
         self.base = None
         self.outdir_input = outdir
@@ -219,13 +287,16 @@ class Dumper:
             except OSError as e:
                 warn(f"字典读取失败: {e}")
         self.soft404 = False
+        self.headers = {"User-Agent": "git/2.40.0", **parse_headers(headers)}
+        (self.ssl_ctx, self._cert_tmpdir,
+         self.cert_pem, self.key_pem) = build_ssl_context(cert, key, p12, p12_password)
 
         self.client = None      # aiohttp.ClientSession, arun 里创建
         self.queued = set()     # 已入队 object sha
         self.inflight = 0       # 正在下载的对象数
         self.dl_count = 0
         self.fail = []
-        self.stop_crawl = False
+        self._fsck_warned = set()   # 已透传的 fsck 错误行 (去重)
 
     # ---------- 网络层 (async) ----------
     async def _raw(self, path, retries=2):
@@ -233,7 +304,7 @@ class Dumper:
         for attempt in range(retries + 1):
             try:
                 async with self.client.get(urljoin(self.base, path),
-                                           proxy=self.proxy, ssl=False) as r:
+                                           proxy=self.proxy, ssl=self.ssl_ctx) as r:
                     return r.status, await r.read()
             except (aiohttp.ClientError, asyncio.TimeoutError):
                 if attempt >= retries:
@@ -243,11 +314,11 @@ class Dumper:
 
     async def fetch(self, path, is_object=False):
         code, body = await self._raw(path)
-        if code != 200 or not body:
+        if code != 200:
             return None
         if self.soft404:
             if is_object:
-                if body[0] != 0x78:
+                if not body or body[0] != 0x78:
                     return None
                 try:
                     zlib.decompress(body)
@@ -266,18 +337,24 @@ class Dumper:
             warn("检测到软404服务器, 启用内容校验模式")
 
     def save(self, path, data):
-        fp = os.path.join(self.gitdir, path)
+        fp = os.path.normpath(os.path.join(self.gitdir, path))
+        if not fp.startswith(self.gitdir + os.sep):
+            warn(f"拒绝越界写入 (恶意服务器路径穿越?): {path}")
+            return
         os.makedirs(os.path.dirname(fp), exist_ok=True)
         with open(fp, "wb") as f:
             f.write(data)
 
     # ---------- 阶段 1: 检测 ----------
     async def check(self):
-        self.base = self.candidates[0]
-        await self.detect_soft404()
+        if not self.candidates:
+            err("目标解析为空")
+            return False
         for cand in self.candidates:
             info(f"尝试: {C.BOLD}{cand}{C.E}")
             self.base = cand
+            self.soft404 = False
+            await self.detect_soft404()   # 每个候选单独探测, http/https 行为可能不同
             d = await self.fetch("HEAD")
             if d and (d.startswith(b"ref:") or SHA1_RE.fullmatch(d.strip())):
                 ok(f".git 泄露确认! HEAD => {C.Y}{d.decode(errors='replace').strip()}{C.E}")
@@ -293,7 +370,8 @@ class Dumper:
                 if hits >= 2:
                     ok(f".git 泄露确认! (文件被禁, 通过{C.Y}目录列举{C.E}发现 {hits} 个 git 特征)")
                     return True
-            dim("不可用, 换下一个候选" if cand != self.candidates[-1] else "")
+            if cand != self.candidates[-1]:
+                dim("不可用, 换下一个候选")
         err("未发现 .git 泄露")
         return False
 
@@ -306,7 +384,81 @@ class Dumper:
                 sys.exit(2)
             shutil.rmtree(self.outdir, ignore_errors=True)
         self.gitdir = os.path.join(self.outdir, ".git")
+        # git 判定仓库要求 HEAD/objects/refs 齐备; crawl 只落盘文件,
+        # 引用全部打包 (packed-refs) 时 refs/ 会是空目录链, 必须显式补建
         os.makedirs(os.path.join(self.gitdir, "objects"), exist_ok=True)
+        os.makedirs(os.path.join(self.gitdir, "refs", "heads"), exist_ok=True)
+        os.makedirs(os.path.join(self.gitdir, "refs", "tags"), exist_ok=True)
+
+    # ---------- 下载来的 config/hooks/info 净化 (反制恶意仓库 RCE/误导) ----------
+    def sanitize_config(self):
+        """服务器可控的 .git/config 含 core.fsmonitor/hooksPath/filter.* 等可执行键,
+        本地 git 命令一跑就会 RCE。整体替换为最小配置, 仅回捞白名单标量键;
+        原文件保留为 config.orig-from-server 供人工分析; hooks 与
+        info/exclude、info/attributes、info/grafts 隔离到 quarantine/。必须在任何作用于
+        gitdir 的 git 命令之前调用。"""
+        cfg = os.path.join(self.gitdir, "config")
+        kept = {}
+        if os.path.isfile(cfg):
+            try:
+                raw = open(cfg, encoding="utf-8", errors="replace").read()
+            except OSError:
+                raw = ""
+            section = ""
+            for line in raw.splitlines():
+                line = line.strip()
+                m = re.match(r'^\[([A-Za-z0-9." -]+)\]', line)
+                if m:
+                    section = m.group(1).split()[0].strip('"').lower()
+                    continue
+                m = re.match(r"^([A-Za-z0-9]+)\s*=\s*(\S+)\s*$", line)
+                if m and section:
+                    key = f"{section}.{m.group(1).lower()}"
+                    if key in SAFE_CONFIG_KEYS and SAFE_VALUE_RE.fullmatch(m.group(2)):
+                        kept[key] = m.group(2)
+            os.replace(cfg, cfg + ".orig-from-server")
+        out = ["[core]",
+               f"\trepositoryformatversion = {kept.get('core.repositoryformatversion', '0')}",
+               "\tbare = false", "\tlogallrefupdates = true"]
+        if "core.filemode" in kept:
+            out.append(f"\tfilemode = {kept['core.filemode']}")
+        ext = [(k.split(".", 1)[1], v) for k, v in kept.items() if k.startswith("extensions.")]
+        if ext:
+            out.append("[extensions]")
+            out += [f"\t{k} = {v}" for k, v in ext]
+        with open(cfg, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+
+        # hooks 目录同样来自服务器: post-checkout 等钩子会在 checkout 时触发
+        hooks = os.path.join(self.gitdir, "hooks")
+        bad = []
+        if os.path.isdir(hooks):
+            bad = [f for f in os.listdir(hooks)
+                   if not f.endswith(".sample") and os.path.isfile(os.path.join(hooks, f))]
+            if bad:
+                q = os.path.join(self.outdir, "quarantine", "hooks")
+                os.makedirs(q, exist_ok=True)
+                for f in bad:
+                    os.replace(os.path.join(hooks, f), os.path.join(q, f))
+
+        # info/exclude 可让 git status 隐藏改动误导分析; info/attributes 可绑定
+        # filter 驱动 (虽已随 config 净化失效, 纵深防御一并隔离);
+        # info/grafts 可伪造父提交关系, 污染 git log 显示的历史
+        idir = os.path.join(self.gitdir, "info")
+        sneaky = [f for f in ("exclude", "attributes", "grafts")
+                  if os.path.isfile(os.path.join(idir, f))]
+        if sneaky:
+            q = os.path.join(self.outdir, "quarantine", "info")
+            os.makedirs(q, exist_ok=True)
+            for f in sneaky:
+                os.replace(os.path.join(idir, f), os.path.join(q, f))
+
+        msg = "config 已净化 (原文件 -> config.orig-from-server)"
+        if bad:
+            msg += f", 隔离 {len(bad)} 个恶意钩子 -> quarantine/hooks/"
+        if sneaky:
+            msg += f", 隔离 info/{', info/'.join(sneaky)} -> quarantine/info/"
+        ok(msg)
 
     # ---------- 阶段 0: 智能协议探测 ----------
     async def try_smart_clone(self):
@@ -315,7 +467,7 @@ class Dumper:
         url = self.base.rstrip("/")
         try:
             async with self.client.get(url + "/info/refs?service=git-upload-pack",
-                                       proxy=self.proxy, ssl=False) as r:
+                                       proxy=self.proxy, ssl=self.ssl_ctx) as r:
                 ct = r.headers.get("Content-Type", "")
                 code = r.status
         except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -324,14 +476,28 @@ class Dumper:
             return False
         ok(f"服务端开启 {C.G}git 智能协议{C.E}! 直接 git clone (单次打包传输, 最快路径)")
         shutil.rmtree(self.outdir, ignore_errors=True)
-        cmd = ["clone", "--quiet"]
+        cmd = ["clone", "--quiet", "-c", "core.autocrlf=false"]
         if self.proxy:
             cmd += ["-c", f"http.proxy={self.proxy}"]
+        # 智能协议走 git 自己的 HTTP 栈, 自定义 header 需显式透传
+        for k, v in self.headers.items():
+            if k.lower() == "user-agent":
+                cmd += ["-c", f"http.userAgent={v}"]
+            else:
+                cmd += ["-c", f"http.extraheader={k}: {v}"]
+        # 客户端证书透传 (git for windows 默认 schannel 不认文件证书, 强制 openssl 后端)
+        if self.cert_pem:
+            cmd += ["-c", "http.sslBackend=openssl",
+                    "-c", f"http.sslCert={self.cert_pem}"]
+            if self.key_pem:
+                cmd += ["-c", f"http.sslKey={self.key_pem}"]
         code, _, errout = await asyncio.to_thread(run_git, cmd + [url, self.outdir], None, None, 900)
         if code == 0:
             return True
         warn(f"clone 失败 ({errout.strip()[:80]}), 回退哑协议逐对象下载")
         os.makedirs(os.path.join(self.gitdir, "objects"), exist_ok=True)
+        os.makedirs(os.path.join(self.gitdir, "refs", "heads"), exist_ok=True)
+        os.makedirs(os.path.join(self.gitdir, "refs", "tags"), exist_ok=True)
         return False
 
     # ---------- 阶段 2: 目录列举爬取 ----------
@@ -353,12 +519,13 @@ class Dumper:
                     print(f"\r    {C.DIM}已爬取 {self._crawl_count} 个文件...{C.E}", end="", flush=True)
 
         async def walk(rel):
-            if self.stop_crawl or self._crawl_count > 20000:
+            if self._crawl_count > 20000:
                 return
             _, html = await self._raw(rel)
             tasks = []
             for link in HREF_RE.findall(html.decode(errors="replace")):
-                if link.startswith(("../", "/")):
+                link = unquote(link)
+                if link.startswith(("../", "/")) or "/../" in link:
                     continue
                 full = rel + link
                 if link.endswith("/"):
@@ -406,38 +573,54 @@ class Dumper:
                 d = await self.fetch(f"objects/pack/{fn}")
                 if d is not None:
                     self.save(f"objects/pack/{fn}", d)
-            size = os.path.getsize(os.path.join(self.gitdir, "objects", "pack", name))
-            dim(f"{C.G}ok{C.E} {name} ({size} bytes)")
+            fp = os.path.join(self.gitdir, "objects", "pack", name)
+            if os.path.exists(fp):
+                dim(f"{C.G}ok{C.E} {name} ({os.path.getsize(fp)} bytes)")
+            else:
+                warn(f"pack 下载失败: {name}")
         await asyncio.gather(*(dl_pair(p) for p in packs))
         return len(packs)
 
     # ---------- 阶段 5: 对象递归下载 (async 工作队列) ----------
-    def object_exists_local(self, sha):
-        p = os.path.join(self.gitdir, "objects", sha[:2], sha[2:])
-        if os.path.exists(p):
-            return True
-        if self.use_git:
-            code, _, _ = run_git(["cat-file", "-e", sha], gitdir=self.gitdir)
-            return code == 0
-        return False
+    @staticmethod
+    def _inflate_verified(sha, raw):
+        """解压 loose object 并校验 sha1(解压内容)==对象名, 防 MITM 篡改/损坏。
+        通过则返回解压后内容, 否则 None。git 对象天然自校验, 篡改必然改变 hash。"""
+        try:
+            de = zlib.decompress(raw)
+        except zlib.error:
+            return None
+        return de if hashlib.sha1(de).hexdigest() == sha else None
 
     async def fetch_and_expand(self, sha):
         """下载/读取一个 loose object, 返回子对象 sha 列表"""
         # 本地优先: crawl/clone 已落盘的对象不走网络
         local = os.path.join(self.gitdir, "objects", sha[:2], sha[2:])
-        raw = None
+        raw = de = None
         if os.path.exists(local):
             try:
                 raw = open(local, "rb").read()
             except OSError:
                 return []
-        else:
+            de = self._inflate_verified(sha, raw)
+            if de is None:
+                # 本地对象损坏/被篡改: 删除并回源重下
+                warn(f"本地对象 {sha[:8]} 校验失败, 删除后回源重下")
+                try:
+                    os.remove(local)
+                except OSError:
+                    pass
+                raw = None
+        if raw is None:
             self.inflight += 1
             try:
                 raw = await self.fetch(f"objects/{sha[:2]}/{sha[2:]}", is_object=True)
             finally:
                 self.inflight -= 1
-            if raw is None:
+            de = self._inflate_verified(sha, raw) if raw else None
+            if de is None:
+                if raw:
+                    warn(f"对象 {sha[:8]} SHA1 校验失败 (MITM 篡改?), 已丢弃")
                 self.fail.append(sha)
                 self.queued.discard(sha)   # 允许重试
                 return []
@@ -445,9 +628,7 @@ class Dumper:
             self.dl_count += 1
             if self.dl_count % 200 == 0:
                 print(f"\r    {C.DIM}已下载对象: {self.dl_count}{C.E}", end="", flush=True)
-        try:
-            de = zlib.decompress(raw)
-        except zlib.error:
+        if de is None:
             return []
 
         header, _, body = de.partition(b"\x00")
@@ -533,8 +714,25 @@ class Dumper:
         for it in range(8):
             _, out, errout = await asyncio.to_thread(
                 run_git, ["fsck", "--full", "--unreachable", "--dangling"], None, self.gitdir, 300)
+            # fsck --full 会解开 pack 内对象逐一验 hash: pack 被篡改/损坏在此处暴露,
+            # 把错误行透传给用户 (否则会随输出解析被静默吞掉)
+            for l in dict.fromkeys((out + errout).splitlines()):
+                l = l.strip()
+                if l.lower().startswith(("error", "fatal")) or "corrupt" in l.lower():
+                    if l not in self._fsck_warned:
+                        self._fsck_warned.add(l)
+                        warn(f"fsck: {l}")
             hashes = set(m.group(0) for m in SHA1_RE.finditer((out + errout).encode()))
-            new = [h for h in hashes if not self.object_exists_local(h)]
+            # 先筛掉本地 loose 已有的, 其余一次性 batch-check (避免每个 hash 起一个子进程)
+            cand = [h for h in hashes
+                    if not os.path.exists(os.path.join(self.gitdir, "objects", h[:2], h[2:]))]
+            new = []
+            if cand:
+                _, chk, _ = await asyncio.to_thread(
+                    run_git, ["cat-file", "--batch-check"], None, self.gitdir, 300,
+                    "\n".join(cand) + "\n")
+                missing = {l.split()[0] for l in chk.splitlines() if l.endswith(" missing")}
+                new = [h for h in cand if h in missing]
             if not new:
                 break
             info(f"fsck 第 {it + 1} 轮: 发现 {C.Y}{len(new)}{C.E} 个缺失对象, 继续下载")
@@ -624,7 +822,10 @@ class Dumper:
                 blob = zlib.decompress(open(p, "rb").read()).partition(b"\x00")[2]
             except zlib.error:
                 continue
-            fp = os.path.join(self.outdir, name)
+            fp = os.path.normpath(os.path.join(self.outdir, name))
+            if not fp.startswith(self.outdir + os.sep):
+                warn(f"index 含越界路径, 跳过: {name}")
+                continue
             os.makedirs(os.path.dirname(fp) or self.outdir, exist_ok=True)
             with open(fp, "wb") as f:
                 f.write(blob)
@@ -640,8 +841,10 @@ class Dumper:
         if code != 0:
             warn("重建的 .git 不完整, 跳过 git 还原 (防止误伤父仓库)")
             return 0
+        # -c core.autocrlf=false: 防用户全局 config 把还原文件 LF 转 CRLF, 保证字节保真
         for cmd in (["checkout", "-f", "HEAD"], ["reset", "--hard", "HEAD"]):
-            run_git(["--git-dir", gd, "--work-tree", wt] + cmd, timeout=120)
+            run_git(["--git-dir", gd, "--work-tree", wt, "-c", "core.autocrlf=false"] + cmd,
+                    timeout=120)
         code, out, _ = run_git(["--git-dir", gd, "--work-tree", wt, "ls-files"])
         n = len(out.strip().splitlines()) if code == 0 and out else 0
         ok(f"git 还原工作区完成, 追踪文件: {C.BOLD}{n}{C.E}")
@@ -654,7 +857,7 @@ class Dumper:
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(
                 connector=conn, timeout=timeout, trust_env=False,
-                headers={"User-Agent": "git/2.40.0"}) as self.client:
+                headers=self.headers) as self.client:
 
             if not await self.check():
                 return 1
@@ -682,6 +885,7 @@ class Dumper:
                 if seeds:
                     await self.download_objects(seeds)
 
+            self.sanitize_config()   # 必须先于一切作用于 gitdir 的 git 命令
             await self.fsck_loop()
 
         # HEAD/refs 被禁的场景: 从对象里重建 HEAD 再还原
@@ -712,7 +916,11 @@ class Dumper:
         return 0
 
     def run(self):
-        return asyncio.run(self.arun())
+        try:
+            return asyncio.run(self.arun())
+        finally:
+            if self._cert_tmpdir:   # p12 解出的临时 PEM 私钥, 用完即删
+                shutil.rmtree(self._cert_tmpdir, ignore_errors=True)
 
 
 # ---------- 交互式 ----------
@@ -738,8 +946,9 @@ def interactive():
             warn("目标不能为空")
             continue
         proxy = prompt("代理 (可空)", "") or None
+        hdr = prompt("自定义Header (可空, 如 Authorization: Bearer xxx)", "")
         print()
-        d = Dumper(url, None, MAX_CONCURRENCY, proxy or None)
+        d = Dumper(url, None, MAX_CONCURRENCY, proxy, headers=[hdr] if hdr else None)
         try:
             d.run()
         except KeyboardInterrupt:
@@ -752,13 +961,19 @@ def interactive():
 
 
 def main():
-    ap = argparse.ArgumentParser(description="zm-git - .git 泄露利用工具 (asyncio+HTTP2/交互式/彩色)")
+    ap = argparse.ArgumentParser(description="zm-git - .git 泄露利用工具 (asyncio+aiohttp/交互式/彩色)")
     ap.add_argument("url", nargs="?", default=None, help="目标 (省略则进入交互式)")
     ap.add_argument("-o", "--output", default=None,
                     help=f"输出目录 (默认固定为 {FIXED_OUTDIR}, 每次覆盖)")
     ap.add_argument("-t", "--threads", type=int, default=MAX_CONCURRENCY,
                     help=f"协程并发数 (默认拉满: {MAX_CONCURRENCY})")
     ap.add_argument("-p", "--proxy", default=None, help="代理 http://127.0.0.1:8080")
+    ap.add_argument("-H", "--header", action="append", default=[], metavar="NAME=VALUE",
+                    help="自定义 HTTP 头, 可重复 (如 -H \"Authorization: Bearer xxx\")")
+    ap.add_argument("--cert", default=None, help="客户端证书 PEM (双向 TLS)")
+    ap.add_argument("--key", default=None, help="客户端私钥 PEM (证书内含私钥可省)")
+    ap.add_argument("--p12", default=None, help="PKCS#12 客户端证书 (需 pip install cryptography)")
+    ap.add_argument("--p12-password", default=None, help="p12 密码 (缺省交互询问)")
     ap.add_argument("--timeout", type=int, default=10, help="请求超时秒数")
     ap.add_argument("--no-git", action="store_true", help="不使用本地 git (纯 python 还原)")
     ap.add_argument("--no-crawl", action="store_true", help="禁用目录列举爬取")
@@ -784,7 +999,8 @@ def main():
 
     d = Dumper(args.url, args.output, args.threads, args.proxy, args.timeout,
                use_git=not args.no_git, crawl=not args.no_crawl, brute=not args.no_brute,
-               wordlist=args.wordlist, pulls=args.pulls)
+               wordlist=args.wordlist, pulls=args.pulls, headers=args.header,
+               cert=args.cert, key=args.key, p12=args.p12, p12_password=args.p12_password)
     try:
         sys.exit(d.run())
     except KeyboardInterrupt:
