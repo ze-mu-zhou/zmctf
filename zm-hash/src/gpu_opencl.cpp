@@ -181,12 +181,20 @@ constexpr unsigned md5_word(unsigned i) {
 }
 
 // Vector width of the generated kernel (candidates per thread iteration).
-// hashcat tunes Vec:8 for MD5 on this GPU class.
-constexpr unsigned VEC = 8;
+// Measured on sm_89 (RTX 4060 Laptop): VEC=16 @ 158 regs beats VEC=8 @ 72
+// regs by ~1.4% despite lower occupancy — ILP wins for MD5. ZM_VEC/ZM_LOCAL
+// allow launch-tuning experiments without recompiling.
+unsigned vec_width() {
+  const char *e = std::getenv("ZM_VEC");
+  const unsigned v = e ? static_cast<unsigned>(std::atoi(e)) : 16;
+  return (v == 4 || v == 8 || v == 16) ? v : 16;
+}
 
-struct alignas(32) VecWords {
-  std::uint32_t v[VEC];
-};
+unsigned local_size_cfg() {
+  const char *e = std::getenv("ZM_LOCAL");
+  const unsigned v = e ? static_cast<unsigned>(std::atoi(e)) : 256;
+  return (v == 128 || v == 256 || v == 512) ? v : 256;
+}
 
 const char *KERNEL_HEAD = R"OPENCL(
 
@@ -238,7 +246,7 @@ __kernel void zm_md5_match(
 //    step 42 and the early reject fires ~33% earlier per candidate;
 //    survivors recompute the tail and take a full masked compare.
 //  - masked (pattern) targets cannot be reversed, so they run all 64 steps.
-std::string build_kernel_source(std::size_t length, bool exact) {
+std::string build_kernel_source(std::size_t length, bool exact, unsigned vec) {
   std::array<bool, 16> zero{};
   for (std::size_t z = length / 4 + 1; z < 14; ++z) zero[z] = true;
   zero[15] = true;  // high length word: always 0 for length <= 55
@@ -253,16 +261,16 @@ std::string build_kernel_source(std::size_t length, bool exact) {
   need[14] = true;
   need[0] = true;
 
-  const std::string vec_t = "uint" + std::to_string(VEC);
-  const std::string int_t = "int" + std::to_string(VEC);
+  const std::string vec_t = "uint" + std::to_string(vec);
+  const std::string int_t = "int" + std::to_string(vec);
   std::string s = KERNEL_HEAD;
   const auto replace_all = [](std::string &text, const std::string &from, const std::string &to) {
     for (std::size_t p = 0; (p = text.find(from, p)) != std::string::npos; p += to.size()) text.replace(p, from.size(), to);
   };
   replace_all(s, "uvec", vec_t);
-  replace_all(s, "VEC", std::to_string(VEC));
+  replace_all(s, "VEC", std::to_string(vec));
   std::string splat_args;
-  for (unsigned i = 0; i != VEC; ++i) splat_args += (i ? ", x" : "x");
+  for (unsigned i = 0; i != vec; ++i) splat_args += (i ? ", x" : "x");
   replace_all(s, "SPLAT_ARGS", splat_args);
 
   char line[224];
@@ -340,7 +348,7 @@ std::string build_kernel_source(std::size_t length, bool exact) {
 
   s += "\n  const " + vec_t + " save_w0 = zm_splat(w0_s);\n";
   s += "  for (u32 it = 0; it < nvec; ++it) {\n";
-  s += "    const u32 base_i = it * " + std::to_string(VEC) + "u;\n";
+  s += "    const u32 base_i = it * " + std::to_string(vec) + "u;\n";
   s += "    const " + vec_t + " w0v = save_w0 | inner_tab[it];\n";
   if (exact) {
     // c42 reject chain (see the reversal notes above); kc47 already holds
@@ -373,9 +381,13 @@ std::string build_kernel_source(std::size_t length, bool exact) {
   for (unsigned i = 0; i != forward_end; ++i) emit_step(i);
 
   const char *lanes4[4] = {"x", "y", "z", "w"};
-  const auto lane_acc = [&](unsigned lane) { return VEC == 4 ? lanes4[lane] : ("s" + std::to_string(lane)); };
+  const auto lane_acc = [&](unsigned lane) {
+    // OpenCL vector components: x/y/z/w for 4-wide, s0..s9/sa..sf otherwise.
+    return vec == 4 ? std::string(lanes4[lane])
+                    : std::string("s") + "0123456789abcdef"[lane];
+  };
   const auto emit_report = [&](const std::string &cond) {
-    for (unsigned lane = 0; lane != VEC; ++lane) {
+    for (unsigned lane = 0; lane != vec; ++lane) {
       const std::string acc = lane_acc(lane);
       s += "      if (" + cond + "." + acc + " && base_i + " + std::to_string(lane) + "u < ic32) {\n";
       s += "        const u32 slot = atomic_add(hit_count, 1u);\n";
@@ -496,8 +508,9 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
 
   // Inner table: entries iterate leading positions with position n_inner-1
   // fastest, consistent with the global enumeration index (it * stride + root).
-  const std::uint64_t inner_vec = (inner_count + VEC - 1) / VEC;
-  std::vector<VecWords> inner_tab(inner_vec);
+  const unsigned vec = vec_width();
+  const std::uint64_t inner_vec = (inner_count + vec - 1) / vec;
+  std::vector<std::uint32_t> inner_tab(inner_vec * vec, 0);
   for (std::uint64_t it = 0; it < inner_count; ++it) {
     std::uint64_t v = it;
     std::uint32_t w0 = 0;
@@ -507,7 +520,7 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
       v /= rd;
       w0 |= static_cast<std::uint32_t>(params.chars[params.offsets[q] + dig]) << ((q & 3) * 8);
     }
-    inner_tab[it / VEC].v[it % VEC] = w0;
+    inner_tab[it] = w0;  // flat layout: entry it lands at lane it % vec
   }
 
   const std::uint64_t roots_total =
@@ -519,8 +532,9 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
   const std::uint64_t roots_per_launch =
       std::clamp<std::uint64_t>((std::uint64_t{1} << 32) / inner_count, 1, std::uint64_t{1} << 24);
 
-  const std::string source = build_kernel_source(L, exact);
-  if (const char *dump = std::getenv("ZM_DUMP_KERNEL"); dump && *dump) {
+  const std::string source = build_kernel_source(L, exact, vec);
+  const char *const dump = std::getenv("ZM_DUMP_KERNEL");
+  if (dump && *dump) {
     if (FILE *f = std::fopen(dump, "w")) { std::fwrite(source.data(), 1, source.size(), f); std::fclose(f); }
   }
 
@@ -540,7 +554,17 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
     const size_t source_len = source.size();
     program = cl.CreateProgramWithSource(context, 1, &source_cstr, &source_len, &err);
     cl_check(err, "clCreateProgramWithSource");
-    err = cl.BuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
+    // -cl-nv-verbose puts ptxas' register/spill report into the build log;
+    // enabled together with ZM_DUMP_KERNEL (log lands in <dump>.log).
+    err = cl.BuildProgram(program, 1, &device, dump && *dump ? "-cl-nv-verbose" : nullptr, nullptr, nullptr);
+    if (dump && *dump) {
+      size_t log_size = 0;
+      cl.GetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+      std::string log(log_size, '\0');
+      cl.GetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), nullptr);
+      const std::string logpath = std::string(dump) + ".log";
+      if (FILE *f = std::fopen(logpath.c_str(), "w")) { std::fwrite(log.data(), 1, log.size(), f); std::fclose(f); }
+    }
     if (err != CL_SUCCESS) {
       size_t log_size = 0;
       cl.GetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
@@ -565,7 +589,7 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
     for (std::size_t q = 0; q < L; ++q) cvt[q] = {params.offsets[q], params.radix[q]};
     cvt_mem.mem = make_ro(cvt.data(), cvt.size() * sizeof(cvt[0]));
     cst_mem.mem = make_ro(params.chars.data(), params.chars.size());
-    tab_mem.mem = make_ro(inner_tab.data(), inner_tab.size() * sizeof(VecWords));
+    tab_mem.mem = make_ro(inner_tab.data(), inner_tab.size() * sizeof(std::uint32_t));
     const std::uint32_t zero = 0;
     count_mem.mem = cl.CreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(zero), const_cast<std::uint32_t *>(&zero), &err);
     cl_check(err, "clCreateBuffer hit_count");
@@ -592,7 +616,10 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
     set_mem(18, index_mem.mem);
     set_mem(19, digest_mem.mem);
 
-    const size_t local_size = 256;
+    // VEC=16 needs 158 regs/thread; 512-thread blocks would exceed the 64K
+    // register file (CL_OUT_OF_RESOURCES), so clamp the block size there.
+    size_t local_size = local_size_cfg();
+    if (vec == 16 && local_size > 256) local_size = 256;
 
     const auto start = std::chrono::steady_clock::now();
     std::uint64_t roots_done = 0;
