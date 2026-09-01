@@ -238,11 +238,10 @@ __kernel void zm_md5_match(
 //  - every fixed message word is folded into a per-step constant K+w (the
 //    F_w1c01 = w[1] + MD5C01 trick), so steps are add+fn+rotl+add only;
 //  - for exact 128-bit targets, steps 63..49 are reversed from the target
-//    once per thread, then step 48 (the first w0-consuming step) minus its
-//    w0 term and step 47's constant part are folded in too; inside the loop
-//    the reversed b43 chain costs 4 vector ops (sub, xor, sub, sub), so the
-//    forward loop stops after step 43 and the early reject fires two steps
-//    earlier (~31% less work per candidate);
+//    once per thread, then steps 48 (the first w0-consuming step, minus its
+//    w0 term), 47 and 46 are folded in as constants too; inside the loop the
+//    reversed c42 chain costs 8 vector ops, so the forward loop stops after
+//    step 42 and the early reject fires ~33% earlier per candidate;
 //    survivors recompute the tail and take a full masked compare.
 //  - masked (pattern) targets cannot be reversed, so they run all 64 steps.
 std::string build_kernel_source(std::size_t length, bool exact) {
@@ -311,15 +310,19 @@ std::string build_kernel_source(std::size_t length, bool exact) {
       s += line;
     }
     // After undoing steps 63..49, (ra, rb, rc, rd) = (V48, V47, V46, V45).
-    // Push the reject two steps deeper, across the w0-consuming step 48:
-    //   V44 = rotr(V48 - V47, 6) - I(V47, V46, V45) - w0 - K48
+    // Push the reject deeper, across the w0-consuming step 48 (same depth as
+    // hashcat's m00000s pre_a/pre_b/pre_c chain):
+    //   V44 = rotr(V48 - V47, 6)  - I(V47, V46, V45) - w0 - K48
     //   V43 = rotr(V47 - V46, 23) - (V44 ^ V45 ^ V46) - w2 - K47
+    //   V42 = rotr(V46 - V45, 16) - (V43 ^ V44 ^ V45) - K46   (w15 = 0)
     // Everything except w0 is a per-thread constant, so the loop only needs
     //   t44 = v44p - w0
     //   t43 = rv46 - (t44 ^ x46) - (K47 + w2)
-    // to compare against the forward b right after step 43.
+    //   t42 = rv45 - (rd ^ t44 ^ t43) - K46
+    // to compare against the forward c right after step 42.
     s += "  const u32 v44p = zm_rotr32(ra - rb, 6u) - ZM_I(rb, rc, rd) - 0xf4292244u;\n";
     s += "  const u32 rv46 = zm_rotr32(rb - rc, 23u);\n";
+    s += "  const u32 rv45 = zm_rotr32(rc - rd, 16u);\n";
     s += "  const u32 x46 = rc ^ rd;\n";
   }
 
@@ -328,16 +331,17 @@ std::string build_kernel_source(std::size_t length, bool exact) {
   s += "    const u32 base_i = it * " + std::to_string(VEC) + "u;\n";
   s += "    const " + vec_t + " w0v = save_w0 | inner_tab[it];\n";
   if (exact) {
-    // b43 reject chain (see the reversal notes above); kc47 already holds
+    // c42 reject chain (see the reversal notes above); kc47 already holds
     // K47 + w2 whenever word 2 is non-zero, otherwise w2 = 0.
     const std::string k47 = zero[2] ? "0xc4ac5665u" : "kc47";
     s += "    const " + vec_t + " t44 = zm_splat(v44p) - w0v;\n";
     s += "    const " + vec_t + " t43 = zm_splat(rv46) - (t44 ^ zm_splat(x46)) - zm_splat(" + k47 + ");\n";
+    s += "    const " + vec_t + " t42 = zm_splat(rv45) - (zm_splat(rd) ^ t44 ^ t43) - zm_splat(0x1fa27cf8u);\n";
   }
   s += "    " + vec_t + " a = zm_splat(0x67452301u), b = zm_splat(0xefcdab89u);\n";
   s += "    " + vec_t + " c = zm_splat(0x98badcfeu), d = zm_splat(0x10325476u);\n";
 
-  const unsigned forward_end = exact ? 44 : 64;
+  const unsigned forward_end = exact ? 43 : 64;
   const auto emit_step = [&](unsigned i) {
     const unsigned t = (4 - (i % 4)) % 4;
     const unsigned g = md5_word(i);
@@ -371,10 +375,10 @@ std::string build_kernel_source(std::size_t length, bool exact) {
   };
 
   if (exact) {
-    // Early reject: after step 43, b must equal the reversed b43 chain value.
-    s += "    const " + int_t + " early = (b == t43);\n";
+    // Early reject: after step 42, c must equal the reversed c42 chain value.
+    s += "    const " + int_t + " early = (c == t42);\n";
     s += "    if (any(early)) {\n";
-    for (unsigned i = 44; i != 64; ++i) {
+    for (unsigned i = 43; i != 64; ++i) {
       // Continuation steps, indented one level deeper.
       const unsigned t = (4 - (i % 4)) % 4;
       const unsigned g = md5_word(i);
