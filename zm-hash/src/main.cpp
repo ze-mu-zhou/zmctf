@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "md5_avx512.hpp"
+#include "gpu_opencl.hpp"
 
 #if defined(ZM_HASH_USE_LIBDIVIDE)
 #include <libdivide.h>
@@ -205,6 +206,7 @@ struct Config {
   bool upper_output = false;
   bool color = true;
   bool simd = true;
+  bool gpu = true;
   std::string text;
 };
 
@@ -264,6 +266,7 @@ void print_help(bool color) {
   --output-case upper|lower  摘要输出大小写（默认 lower）
   --no-color                 关闭彩色输出，适合重定向到文件
   --no-simd                  强制使用标量 MD5 路径（benchmark 和搜索）
+  --gpu / --no-gpu           match 模式启用/禁用 GPU（OpenCL，长度 ≤ 55，默认自动）
   --mode hash|match|weak-collision|prefix-collision|collision|benchmark|selftest
 
 selftest 校验 AVX-512 流式多块 MD5 与标量实现逐字节一致（无 AVX-512 时跳过）。
@@ -303,6 +306,8 @@ Config parse(int argc, char **argv) {
     else if (a == "--output-case") { auto v = value(); if (v == "upper") c.upper_output = true; else if (v != "lower") usage_error("output-case 必须是 upper 或 lower"); }
     else if (a == "--no-color") c.color = false;
     else if (a == "--no-simd") c.simd = false;
+    else if (a == "--gpu") c.gpu = true;
+    else if (a == "--no-gpu") c.gpu = false;
     else if (a == "--text") c.text = value();
     else usage_error("未知选项：" + std::string(a));
   }
@@ -798,6 +803,48 @@ int run_selftest(const Config &c) {
   return 0;
 }
 
+int run_gpu_match(const Config &c, const SearchSpace &space, std::uint64_t limit,
+                  bool has_target, const Digest &target_digest, const std::string &pattern) {
+  GpuMatchParams p;
+  p.length = static_cast<std::uint32_t>(c.length);
+  p.offsets.reserve(c.length + 1);
+  for (std::size_t pos = 0; pos != c.length; ++pos) {
+    p.offsets.push_back(static_cast<std::uint32_t>(p.chars.size()));
+    p.chars.insert(p.chars.end(), space.chars[pos].begin(), space.chars[pos].end());
+    p.radix.push_back(static_cast<std::uint32_t>(space.radix[pos]));
+  }
+  p.offsets.push_back(static_cast<std::uint32_t>(p.chars.size()));
+  p.limit = limit;
+  const auto spec = make_match_spec(has_target, target_digest, pattern);
+  for (unsigned b = 0; b != 16; ++b) {
+    p.value[b / 4] |= static_cast<std::uint32_t>(spec.value[b]) << (8 * (b % 4));
+    p.mask[b / 4] |= static_cast<std::uint32_t>(spec.mask[b]) << (8 * (b % 4));
+  }
+  p.max_hits = std::min<std::uint64_t>(c.max_output, 65536);
+  p.interrupted = &interrupted;
+  const auto result = gpu_match(p);
+
+  auto hits = std::move(result.hits);
+  std::ranges::sort(hits, {}, &GpuMatchHit::index);
+  Cursor cursor;
+  for (const auto &hit : hits) {
+    Digest d;
+    for (unsigned w = 0; w != 4; ++w) store32(d.data() + 4 * w, hit.digest[w]);
+    seek_cursor(cursor, hit.index, space);
+    std::cout << hex(d, c.upper_output) << "  "
+              << std::string(cursor.candidate.begin(), cursor.candidate.end()) << '\n';
+  }
+  const double rate = result.seconds > 0 ? static_cast<double>(result.processed) / result.seconds : 0;
+  std::cerr << paint("已搜索候选数：", Ansi::yellow, c.color) << result.processed
+            << paint("（GPU ", Ansi::cyan, c.color) << std::fixed << std::setprecision(3) << result.seconds << " 秒，"
+            << std::setprecision(2) << rate << " hashes/s）\n";
+  if (interrupted.load(std::memory_order_relaxed)) std::cerr << paint("已收到 Ctrl+C，搜索已停止。", Ansi::yellow, c.color) << '\n';
+  else if (result.hit_total > hits.size())
+    std::cerr << paint("命中数超过缓冲上限，输出已截断：", Ansi::yellow, c.color) << result.hit_total << " 个命中\n";
+  else if (result.hit_total >= c.max_output) std::cerr << paint("已达到输出上限，搜索已停止。", Ansi::yellow, c.color) << '\n';
+  return 0;
+}
+
 int run(const Config &c) {
   if (c.mode == Config::Mode::Selftest) return run_selftest(c);
   if (c.mode == Config::Mode::Benchmark) return run_benchmark(c);
@@ -820,6 +867,13 @@ int run(const Config &c) {
   // path so absurdly long candidates fall back to the scalar multi-block loop.
   const bool use_simd = c.simd && c.length <= 65535 && md5_avx512_available();
   const auto match_spec = make_match_spec(has_target, target_digest, pattern);
+  if (c.mode == Config::Mode::Match && c.gpu && c.length >= 1 && c.length <= 55 && gpu_available()) {
+    try {
+      return run_gpu_match(c, space, limit, has_target, target_digest, pattern);
+    } catch (const std::exception &e) {
+      std::cerr << paint("GPU 路径失败，回退 CPU：", Ansi::red, c.color) << e.what() << '\n';
+    }
+  }
   std::atomic<std::uint64_t> next{0};
   std::atomic<bool> stop{false};
   std::atomic<bool> found{false};

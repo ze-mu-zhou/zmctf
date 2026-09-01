@@ -5,10 +5,10 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(zm-hash src/main.cpp src/md5_avx512.cpp)
+add_executable(zm-hash src/main.cpp src/md5_avx512.cpp src/gpu_opencl.cpp)
 target_compile_features(zm-hash PRIVATE cxx_std_26)
 find_package(Threads REQUIRED)
-target_link_libraries(zm-hash PRIVATE Threads::Threads)
+target_link_libraries(zm-hash PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 
 option(ZM_HASH_ENABLE_AVX512 "Build the optional AVX-512 MD5 kernel" ON)
 option(ZM_HASH_USE_LIBDIVIDE "Use libdivide for runtime mixed-radix decoding" ON)
