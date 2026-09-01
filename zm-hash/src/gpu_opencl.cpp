@@ -184,10 +184,6 @@ constexpr unsigned md5_word(unsigned i) {
 // hashcat tunes Vec:8 for MD5 on this GPU class.
 constexpr unsigned VEC = 8;
 
-struct alignas(16) RootWord4 {
-  std::uint32_t v[4];
-};
-
 struct alignas(32) VecWords {
   std::uint32_t v[VEC];
 };
@@ -212,18 +208,13 @@ __kernel void zm_md5_match(
     const u64 inner_count, const u64 stride,
     const u32 v0, const u32 v1, const u32 v2, const u32 v3,
     const u32 m0, const u32 m1, const u32 m2, const u32 m3,
-    __global const uint4 *root_words,
-    __global const uvec *inner_tab,
+    __global const uint2 *cvt, __global const uchar *cst,
+    __global const uvec *inner_tab, const u32 n_inner_rt,
     const u32 max_hits, __global u32 *hit_count,
     __global u64 *hit_index, __global uint4 *hit_digest)
 {
   const u64 gid = (u64) get_global_id(0);
   if (gid >= roots_this) return;
-  __global const uint4 *rw = root_words + gid * 4u;
-  const uint4 r0 = rw[0];
-  const uint4 r1 = rw[1];
-  const uint4 r2 = rw[2];
-  const uint4 r3 = rw[3];
 
   const u64 root_index = launch_base + gid;
   const u32 ic32 = (u32) inner_count;
@@ -233,6 +224,9 @@ __kernel void zm_md5_match(
 
 // The kernel body is generated per launch shape, following hashcat's
 // m00000_a3-optimized (m00000s) single-target kernel:
+//  - each thread decodes its own root candidate (trailing positions) from the
+//    global index through a tiny mixed-radix convert table — no host-side
+//    decode, no per-root upload, one launch covers the whole space;
 //  - the inner loop varies only message word 0 (leading candidate bytes), via
 //    a host-precomputed OR table, VEC candidates per thread (u32x8 ILP);
 //  - every fixed message word is folded into a per-step constant K+w (the
@@ -272,10 +266,28 @@ std::string build_kernel_source(std::size_t length, bool exact) {
   replace_all(s, "SPLAT_ARGS", splat_args);
 
   char line[224];
-  const char *comp = "xyzw";
+  // In-kernel root decode: each thread expands its root index into the
+  // trailing positions [n_inner, L) via the mixed-radix convert table.
+  // Manually unrolled with constant position/shift per line, so dw[] stays in
+  // registers; guards are uniform across threads (n_inner_rt is a scalar).
+  s += "  u32 dw[14] = {0};\n";
+  s += "  u64 rr = root_index;\n";
+  for (std::size_t q = length; q-- > 0;) {
+    std::snprintf(line, sizeof(line),
+                  "  if (%u >= n_inner_rt) { const uint2 pr = cvt[%u]; const u64 qq = rr / pr.y;\n"
+                  "    dw[%u] |= (u32) cst[pr.x + (u32) (rr - qq * pr.y)] << %u; rr = qq; }\n",
+                  (unsigned)q, (unsigned)q, (unsigned)(q >> 2), (unsigned)((q & 3) * 8));
+    s += line;
+  }
+  std::snprintf(line, sizeof(line), "  dw[%u] |= 0x80u << %u;\n",
+                (unsigned)(length / 4), (unsigned)((length & 3) * 8));
+  s += line;
   for (unsigned i = 0; i != 16; ++i) {
     if (!need[i]) continue;
-    std::snprintf(line, sizeof(line), "  const u32 w%u_s = r%u.%c;\n", i, i / 4, comp[i % 4]);
+    if (i == 14)
+      std::snprintf(line, sizeof(line), "  const u32 w14_s = %uu;\n", (unsigned)(length * 8));
+    else
+      std::snprintf(line, sizeof(line), "  const u32 w%u_s = dw[%u];\n", i, i);
     s += line;
   }
 
@@ -501,10 +513,11 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
   const std::uint64_t roots_total =
       std::min(stride, (params.limit + inner_count - 1) / inner_count);
   const std::uint32_t max_hits = static_cast<std::uint32_t>(std::min<std::uint64_t>(params.max_hits, 65536));
-  // Fill the GPU: a launch should span several waves of threads (tens of
-  // thousands) or the SMs starve. Cap the root staging at 16 MiB.
+  // No per-root staging any more (threads decode their own root), so a launch
+  // is chunked only to bound per-launch work (~2^32 candidates, a few hundred
+  // ms) for interrupt responsiveness, and to stay clear of grid-size limits.
   const std::uint64_t roots_per_launch =
-      std::clamp<std::uint64_t>((std::uint64_t{1} << 30) / inner_count, 1, 262144);
+      std::clamp<std::uint64_t>((std::uint64_t{1} << 32) / inner_count, 1, std::uint64_t{1} << 24);
 
   const std::string source = build_kernel_source(L, exact);
   if (const char *dump = std::getenv("ZM_DUMP_KERNEL"); dump && *dump) {
@@ -520,7 +533,7 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
   GpuMatchResult result;
   cl_program program = nullptr;
   cl_kernel kernel = nullptr;
-  ClMem roots_mem(&cl), tab_mem(&cl);
+  ClMem cvt_mem(&cl), cst_mem(&cl), tab_mem(&cl);
   ClMem count_mem(&cl), index_mem(&cl), digest_mem(&cl);
   try {
     const char *source_cstr = source.c_str();
@@ -546,8 +559,12 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
       cl_check(e, "clCreateBuffer");
       return m;
     };
-    roots_mem.mem = cl.CreateBuffer(context, CL_MEM_READ_ONLY, sizeof(RootWord4) * 4 * roots_per_launch, nullptr, &err);
-    cl_check(err, "clCreateBuffer root_words");
+    // Mixed-radix convert table: per position {charset offset, radix}; the
+    // charset bytes buffer is uploaded verbatim (offsets index into it).
+    std::vector<std::array<std::uint32_t, 2>> cvt(L);
+    for (std::size_t q = 0; q < L; ++q) cvt[q] = {params.offsets[q], params.radix[q]};
+    cvt_mem.mem = make_ro(cvt.data(), cvt.size() * sizeof(cvt[0]));
+    cst_mem.mem = make_ro(params.chars.data(), params.chars.size());
     tab_mem.mem = make_ro(inner_tab.data(), inner_tab.size() * sizeof(VecWords));
     const std::uint32_t zero = 0;
     count_mem.mem = cl.CreateBuffer(context, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR, sizeof(zero), const_cast<std::uint32_t *>(&zero), &err);
@@ -566,50 +583,21 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
       set_u32(4 + i, params.value[i]);
       set_u32(8 + i, params.mask[i]);
     }
-    set_mem(12, roots_mem.mem);
-    set_mem(13, tab_mem.mem);
-    set_u32(14, max_hits);
-    set_mem(15, count_mem.mem);
-    set_mem(16, index_mem.mem);
-    set_mem(17, digest_mem.mem);
+    set_mem(12, cvt_mem.mem);
+    set_mem(13, cst_mem.mem);
+    set_mem(14, tab_mem.mem);
+    set_u32(15, static_cast<std::uint32_t>(n_inner));
+    set_u32(16, max_hits);
+    set_mem(17, count_mem.mem);
+    set_mem(18, index_mem.mem);
+    set_mem(19, digest_mem.mem);
 
     const size_t local_size = 256;
-    std::vector<RootWord4> staging(4 * roots_per_launch);
-    std::vector<std::uint32_t> digits(L);
 
     const auto start = std::chrono::steady_clock::now();
     std::uint64_t roots_done = 0;
     while (roots_done < roots_total) {
       const std::uint64_t roots_this = std::min(roots_per_launch, roots_total - roots_done);
-
-      // Host-side root decode over the trailing positions [n_inner, L):
-      // seek the mixed-radix digit cursor to the first root of this chunk,
-      // then repack 16 message words per root (padding and length preset),
-      // advancing the cursor with carry per root.
-      std::uint64_t r = roots_done;
-      for (std::size_t q = L; q-- > n_inner;) {
-        digits[q] = static_cast<std::uint32_t>(r % params.radix[q]);
-        r /= params.radix[q];
-      }
-      for (std::uint64_t root = 0; root < roots_this; ++root) {
-        std::uint32_t w[16] = {};
-        for (std::size_t q = n_inner; q < L; ++q)
-          w[q >> 2] |= static_cast<std::uint32_t>(params.chars[params.offsets[q] + digits[q]]) << ((q & 3) * 8);
-        w[L >> 2] |= 0x80u << ((L & 3) * 8);
-        w[14] = static_cast<std::uint32_t>(L * 8);
-        auto *dst = &staging[4 * root];
-        for (unsigned i = 0; i != 4; ++i)
-          for (unsigned j = 0; j != 4; ++j) dst[i].v[j] = w[4 * i + j];
-        for (std::size_t q = L; q-- > n_inner;) {
-          if (++digits[q] < params.radix[q]) break;
-          digits[q] = 0;
-        }
-      }
-      cl_check(cl.EnqueueWriteBuffer(queue, roots_mem.mem, CL_TRUE, 0,
-                                     sizeof(RootWord4) * 4 * roots_this, staging.data(),
-                                     0, nullptr, nullptr),
-               "clEnqueueWriteBuffer roots");
-
       set_u64(0, roots_done);
       set_u64(1, roots_this);
       const size_t global_size = static_cast<size_t>((roots_this + local_size - 1) / local_size) * local_size;

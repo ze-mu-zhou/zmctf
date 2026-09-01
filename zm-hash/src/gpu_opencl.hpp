@@ -6,11 +6,11 @@
 #include <vector>
 
 // GPU (OpenCL) match search, kernel structure ported from hashcat's
-// m00000_a3-optimized: the host decodes each "root" candidate (trailing
-// positions) into 16 pre-packed message words; each GPU thread iterates the
-// leading bytes (message word 0) via a precomputed OR table with all fixed
-// words folded into per-step constants, and exact 128-bit targets early-reject
-// after step 47 by reversing round 4 from the digest.
+// m00000_a3-optimized: each GPU thread decodes its own "root" candidate
+// (trailing positions) from the global index via a mixed-radix convert table,
+// iterates the leading bytes (message word 0) via a precomputed OR table with
+// all fixed words folded into per-step constants, and exact 128-bit targets
+// early-reject after step 42 by reversing rounds from the digest.
 struct GpuMatchParams {
   std::uint32_t length = 0;
   std::vector<std::uint8_t> chars;     // concatenated per-position charsets
