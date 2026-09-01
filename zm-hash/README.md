@@ -57,7 +57,7 @@ cmake --build build-ofast -j
 
 混合进制解码默认使用 vendored 的官方 `libdivide` v5.3.0 单头文件，不需要配置时联网；使用 `-DZM_HASH_USE_LIBDIVIDE=OFF` 可关闭并回退原生除法。
 
-在支持 AVX-512F 的 x86-64 CPU 上，benchmark 会自动使用 16 路 AVX-512 单块 MD5；不支持时自动回退标量实现。使用 `--no-simd` 可强制测量标量基线。当前 AVX-512 路径用于 benchmark 对照，搜索模式仍使用标量路径。
+在支持 AVX-512F 的 x86-64 CPU 上，benchmark 和搜索模式都会自动使用 16 路 AVX-512 MD5；不支持时自动回退标量实现，使用 `--no-simd` 可强制标量基线。搜索热路径采用 hashcat GPU 内核风格的持久 word-major 消息缓冲：填充位（`0x80` 与长度字段）每线程只预置一次，候选枚举个线程 16 条交错 lane，每条 lane 步进 16 时只重写发生进位的消息字节；摘要判定（完整目标、`?` 通配、PHP magic hash）在 lane 向量上用掩码完成，只有命中的 lane 才标量化。多块链式压缩支持任意长度（超过 65535 字节回退标量），流式 ctx（移植自 hashcat `md5_ctx_vector_t`）保留为通用 API。`--mode selftest` 用不规则分块把 0..512 字节的流式/链式结果与标量实现逐字节比对，并校验向量化掩码判定。
 
 MSVC 使用独立的 `md5_avx512.cpp` 编译单元；CMake 会探测 `/arch:AVX512`，只有支持该选项时才启用 AVX-512 代码，主程序本身不强制使用 AVX-512。建议使用支持 `/arch:AVX512` 的新版本 Visual Studio；旧版可通过 `-DZM_HASH_ENABLE_AVX512=OFF` 构建标量版本。
 

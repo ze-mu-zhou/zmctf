@@ -13,6 +13,7 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <stdexcept>
@@ -190,7 +191,7 @@ unsigned default_thread_count() noexcept {
 }
 
 struct Config {
-  enum class Mode { Hash, Match, PhpWeak, Prefix, Collision, Benchmark } mode = Mode::Match;
+  enum class Mode { Hash, Match, PhpWeak, Prefix, Collision, Benchmark, Selftest } mode = Mode::Match;
   std::size_t length = 1;
   std::string charset = "lower", custom_charset;
   std::string allow, deny, position_spec, pattern, target;
@@ -262,8 +263,10 @@ void print_help(bool color) {
   --bench-warmup N           benchmark 预热轮数（默认 1）
   --output-case upper|lower  摘要输出大小写（默认 lower）
   --no-color                 关闭彩色输出，适合重定向到文件
-  --no-simd                  benchmark 强制使用标量路径
-  --mode hash|match|weak-collision|prefix-collision|collision|benchmark
+  --no-simd                  强制使用标量 MD5 路径（benchmark 和搜索）
+  --mode hash|match|weak-collision|prefix-collision|collision|benchmark|selftest
+
+selftest 校验 AVX-512 流式多块 MD5 与标量实现逐字节一致（无 AVX-512 时跳过）。
 
 weak-collision 使用 PHP magic hash 语义：两个 MD5 都必须匹配 ^0e[0-9]+$。
 )";
@@ -281,7 +284,7 @@ Config parse(int argc, char **argv) {
     const std::string_view a = argv[i];
     auto value = [&]() -> std::string { if (++i >= argc) usage_error("选项缺少参数：" + std::string(a)); return argv[i]; };
     if (a == "--help" || a == "-h") { print_help(c.color); std::exit(0); }
-    else if (a == "--mode") { auto v = value(); if (v == "hash") c.mode = Config::Mode::Hash; else if (v == "match") c.mode = Config::Mode::Match; else if (v == "weak-collision" || v == "php-weak" || v == "0e") c.mode = Config::Mode::PhpWeak; else if (v == "prefix-collision") c.mode = Config::Mode::Prefix; else if (v == "collision") c.mode = Config::Mode::Collision; else if (v == "benchmark" || v == "bench") c.mode = Config::Mode::Benchmark; else usage_error("未知模式：" + v); }
+    else if (a == "--mode") { auto v = value(); if (v == "hash") c.mode = Config::Mode::Hash; else if (v == "match") c.mode = Config::Mode::Match; else if (v == "weak-collision" || v == "php-weak" || v == "0e") c.mode = Config::Mode::PhpWeak; else if (v == "prefix-collision") c.mode = Config::Mode::Prefix; else if (v == "collision") c.mode = Config::Mode::Collision; else if (v == "benchmark" || v == "bench") c.mode = Config::Mode::Benchmark; else if (v == "selftest" || v == "self-test") c.mode = Config::Mode::Selftest; else usage_error("未知模式：" + v); }
     else if (a == "--length") c.length = number(value());
     else if (a == "--charset") c.charset = value();
     else if (a == "--charset-custom") c.custom_charset = value();
@@ -363,31 +366,152 @@ SearchSpace make_space(const Config &c) {
   return s;
 }
 
-void decode(std::uint64_t index, const SearchSpace &space, std::vector<std::uint8_t> &out) {
-  out.resize(space.chars.size());
-  for (std::size_t i = space.chars.size(); i-- > 0;) {
+// Per-thread enumeration cursor: seek does one full mixed-radix decode,
+// advance then increments in place with carry (amortized O(1) per candidate).
+struct Cursor {
+  std::vector<std::uint8_t> candidate;
+  std::vector<std::uint32_t> pos;
+};
+
+void seek_cursor(Cursor &cursor, std::uint64_t index, const SearchSpace &space) {
+  const auto n = space.chars.size();
+  cursor.candidate.resize(n);
+  cursor.pos.resize(n);
+  for (std::size_t i = n; i-- > 0;) {
     const auto radix = space.radix[i];
 #if defined(ZM_HASH_USE_LIBDIVIDE)
     const auto quotient = index / space.dividers[i];
-    out[i] = space.chars[i][index - quotient * radix];
+    cursor.pos[i] = static_cast<std::uint32_t>(index - quotient * radix);
     index = quotient;
 #else
-    out[i] = space.chars[i][index % radix];
+    cursor.pos[i] = static_cast<std::uint32_t>(index % radix);
     index /= radix;
 #endif
+    cursor.candidate[i] = space.chars[i][cursor.pos[i]];
   }
 }
 
-bool matches_pattern(const std::string &digest, std::string_view pattern) {
+void advance_cursor(Cursor &cursor, const SearchSpace &space) {
+  for (std::size_t i = cursor.pos.size(); i-- > 0;) {
+    if (++cursor.pos[i] < space.radix[i]) {
+      cursor.candidate[i] = space.chars[i][cursor.pos[i]];
+      return;
+    }
+    cursor.pos[i] = 0;
+    cursor.candidate[i] = space.chars[i][0];
+  }
+}
+
+// 16 interleaved enumeration lanes over persistent word-major message blocks
+// (hashcat GPU-kernel style): padding is preset once, and advancing a lane by
+// 16 candidates rewrites only the message bytes whose digit actually changed.
+struct LaneSearcher {
+  const SearchSpace &space;
+  const std::size_t length;
+  const std::size_t blocks;
+  std::vector<std::uint32_t> mw;  // [block * 256 + word * 16 + lane]
+  std::vector<std::uint8_t> pos;  // [lane * length + position]
+  std::array<std::uint64_t, 16> lane_idx{};
+
+  explicit LaneSearcher(const SearchSpace &s)
+      : space(s), length(s.chars.size()), blocks((s.chars.size() + 9 + 63) / 64) {
+    mw.assign(blocks * 16 * 16, 0);
+    pos.assign(16 * length, 0);
+    const std::uint64_t bits = static_cast<std::uint64_t>(length) * 8;
+    const std::size_t pad = (length / 64) * 256 + ((length % 64) / 4) * 16;
+    const std::size_t tail = (blocks - 1) * 256;
+    for (unsigned lane = 0; lane != 16; ++lane) {
+      mw[pad + lane] |= 0x80u << (8 * (length % 4));
+      mw[tail + 14 * 16 + lane] = static_cast<std::uint32_t>(bits);
+      mw[tail + 15 * 16 + lane] = static_cast<std::uint32_t>(bits >> 32);
+    }
+  }
+
+  void put_byte(unsigned lane, std::size_t p, std::uint8_t byte) {
+    auto &w = mw[(p / 64) * 256 + ((p % 64) / 4) * 16 + lane];
+    const unsigned shift = 8 * (p % 4);
+    w = (w & ~(0xffu << shift)) | (static_cast<std::uint32_t>(byte) << shift);
+  }
+
+  void seek_lane(unsigned lane, std::uint64_t index, Cursor &cursor) {
+    lane_idx[lane] = index;
+    seek_cursor(cursor, space.total ? index % space.total : 0, space);
+    for (std::size_t p = 0; p != length; ++p) {
+      pos[lane * length + p] = static_cast<std::uint8_t>(cursor.pos[p]);
+      put_byte(lane, p, cursor.candidate[p]);
+    }
+  }
+
+  void seek(std::uint64_t begin, Cursor &cursor) {
+    for (unsigned lane = 0; lane != 16; ++lane) seek_lane(lane, begin + lane, cursor);
+  }
+
+  // Advance one lane by 16 candidates, rewriting only the positions that carry.
+  void advance_lane(unsigned lane, Cursor &cursor) {
+    lane_idx[lane] += 16;
+    if (lane_idx[lane] >= space.total) { seek_lane(lane, lane_idx[lane], cursor); return; }
+    std::uint32_t carry = 16;
+    std::size_t p = length;
+    while (carry && p-- > 0) {
+      const auto radix = static_cast<std::uint32_t>(space.radix[p]);
+      std::uint32_t v = pos[lane * length + p] + carry;
+      carry = 0;
+      while (v >= radix) { v -= radix; ++carry; }
+      pos[lane * length + p] = static_cast<std::uint8_t>(v);
+      put_byte(lane, p, space.chars[p][v]);
+    }
+  }
+};
+
+void lane_digest(const std::uint32_t *h, unsigned lane, Digest &out) {
+  for (unsigned word = 0; word != 4; ++word) {
+    const auto v = h[word * 16 + lane];
+    out[word * 4 + 0] = static_cast<std::uint8_t>(v);
+    out[word * 4 + 1] = static_cast<std::uint8_t>(v >> 8);
+    out[word * 4 + 2] = static_cast<std::uint8_t>(v >> 16);
+    out[word * 4 + 3] = static_cast<std::uint8_t>(v >> 24);
+  }
+}
+
+std::string lane_candidate(const LaneSearcher &lanes, unsigned lane) {
+  std::string s(lanes.length, '\0');
+  for (std::size_t p = 0; p != lanes.length; ++p)
+    s[p] = static_cast<char>(lanes.space.chars[p][lanes.pos[lane * lanes.length + p]]);
+  return s;
+}
+
+// Compile a target digest or a normalized `?` pattern into per-byte masks.
+Md5Avx512Match make_match_spec(bool has_target, const Digest &target, const std::string &pattern) {
+  Md5Avx512Match spec;
+  if (has_target) {
+    for (unsigned b = 0; b != 16; ++b) { spec.value[b] = target[b]; spec.mask[b] = 0xff; }
+    return spec;
+  }
+  auto nibble = [](char ch) { return static_cast<std::uint8_t>(ch <= '9' ? ch - '0' : ch - 'a' + 10); };
+  for (unsigned b = 0; b != 16 && 2 * b + 1 < pattern.size(); ++b) {
+    if (pattern[2 * b] != '?') { spec.mask[b] |= 0xf0; spec.value[b] |= static_cast<std::uint8_t>(nibble(pattern[2 * b]) << 4); }
+    if (pattern[2 * b + 1] != '?') { spec.mask[b] |= 0x0f; spec.value[b] |= nibble(pattern[2 * b + 1]); }
+  }
+  return spec;
+}
+
+// Nibble-level checks on the raw digest, avoiding per-candidate hex strings
+// in the search hot path. Pattern must already be normalized to lowercase.
+bool matches_pattern(const Digest &digest, std::string_view pattern) {
   if (pattern.empty()) return true;
   if (pattern.size() != 32) return false;
-  for (std::size_t i = 0; i != 32; ++i) if (pattern[i] != '?' && std::tolower(static_cast<unsigned char>(pattern[i])) != digest[i]) return false;
+  for (std::size_t i = 0; i != 32; ++i) {
+    if (pattern[i] == '?') continue;
+    const auto nibble = (i % 2 == 0) ? (digest[i / 2] >> 4) : (digest[i / 2] & 15);
+    const char want = static_cast<char>(nibble < 10 ? '0' + nibble : 'a' + nibble - 10);
+    if (pattern[i] != want) return false;
+  }
   return true;
 }
 
-bool is_php_magic_hash(const std::string &digest) {
-  if (digest.size() != 32 || digest[0] != '0' || digest[1] != 'e') return false;
-  for (std::size_t i = 2; i != digest.size(); ++i) if (digest[i] < '0' || digest[i] > '9') return false;
+bool is_php_magic_hash(const Digest &digest) {
+  if (digest[0] != 0x0e) return false;
+  for (std::size_t i = 1; i != 16; ++i) if ((digest[i] >> 4) > 9 || (digest[i] & 15) > 9) return false;
   return true;
 }
 
@@ -436,8 +560,6 @@ std::pair<double, std::uint64_t> benchmark_once(const SearchSpace &space, std::u
     for (unsigned t = 0; t < threads; ++t) {
       workers.emplace_back([&, t](std::stop_token) {
         try {
-          std::vector<std::uint8_t> candidate;
-          candidate.reserve(space.chars.size());
           Md5Scratch scratch;
           std::uint64_t sink = 0;
           {
@@ -447,26 +569,29 @@ std::pair<double, std::uint64_t> benchmark_once(const SearchSpace &space, std::u
             gate_cv.wait(lock, [&] { return start || startup_failed.load(std::memory_order_relaxed); });
             if (startup_failed.load(std::memory_order_relaxed)) return;
           }
+          Cursor cursor;
           if (use_simd) {
-            std::array<std::array<std::uint8_t, 56>, 16> batch{};
-            std::array<Digest, 16> digests{};
+            LaneSearcher lanes(space);
+            std::array<std::uint32_t, 64> h;
+            Digest digest;
             while (!stop.load(std::memory_order_relaxed)) {
               const auto begin = next.fetch_add(256, std::memory_order_relaxed);
               if (begin >= count) break;
               const auto end = std::min<std::uint64_t>(count, begin + 256);
+              lanes.seek(begin, cursor);
               auto i = begin;
               for (; i + 16 <= end; i += 16) {
+                md5_avx512_transform_blocks(lanes.mw.data(), lanes.blocks, h.data());
                 for (unsigned lane = 0; lane != 16; ++lane) {
-                  batch[lane].fill(0);
-                  decode(space.total == 0 ? 0 : (i + lane) % space.total, space, candidate);
-                  std::copy(candidate.begin(), candidate.end(), batch[lane].begin());
+                  lane_digest(h.data(), lane, digest);
+                  sink ^= digest_checksum(digest);
                 }
-                md5_avx512_16(std::span<const std::array<std::uint8_t, 56>, 16>(batch), space.chars.size(), digests);
-                for (const auto &d : digests) sink ^= digest_checksum(d);
+                for (unsigned lane = 0; lane != 16; ++lane) lanes.advance_lane(lane, cursor);
               }
+              if (i < end) seek_cursor(cursor, i % space.total, space);
               for (; i < end && !stop.load(std::memory_order_relaxed); ++i) {
-                decode(space.total == 0 ? 0 : i % space.total, space, candidate);
-                sink ^= digest_checksum(md5(candidate, scratch));
+                sink ^= digest_checksum(md5(cursor.candidate, scratch));
+                advance_cursor(cursor, space);
               }
             }
           } else {
@@ -474,9 +599,10 @@ std::pair<double, std::uint64_t> benchmark_once(const SearchSpace &space, std::u
               const auto begin = next.fetch_add(256, std::memory_order_relaxed);
               if (begin >= count) break;
               const auto end = std::min<std::uint64_t>(count, begin + 256);
+              seek_cursor(cursor, begin % space.total, space);
               for (auto i = begin; i < end && !stop.load(std::memory_order_relaxed); ++i) {
-                decode(space.total == 0 ? 0 : i % space.total, space, candidate);
-                sink ^= digest_checksum(md5(candidate, scratch));
+                sink ^= digest_checksum(md5(cursor.candidate, scratch));
+                advance_cursor(cursor, space);
               }
             }
           }
@@ -530,7 +656,7 @@ int run_benchmark(const Config &c) {
   auto space = make_space(c);
   if (space.total == 0) usage_error("benchmark 字符空间为空");
   const auto threads = std::max(1u, c.threads);
-  const bool use_simd = c.simd && c.length <= 55 && md5_avx512_available();
+  const bool use_simd = c.simd && md5_avx512_available();
   std::cerr << paint("benchmark：", Ansi::cyan, c.color) << c.bench_candidates << " 个候选，" << threads << " 个线程，"
             << (use_simd ? "AVX-512 16 路" : "标量") << "\n";
   for (unsigned i = 0; i < c.bench_warmup; ++i) benchmark_once(space, c.bench_candidates, threads, use_simd);
@@ -551,7 +677,129 @@ int run_benchmark(const Config &c) {
   return 0;
 }
 
+// Feeds every length 0..512 through the streaming AVX-512 ctx with an
+// irregular chunking pattern and compares all 16 lanes against scalar MD5.
+int run_selftest(const Config &c) {
+  if (!md5_avx512_available()) {
+    std::cerr << paint("selftest：", Ansi::yellow, c.color) << "AVX-512 不可用，跳过\n";
+    return 0;
+  }
+  static constexpr std::size_t kMaxLen = 512;
+  std::vector<std::uint8_t> lane_bytes(16 * kMaxLen);
+  std::uint64_t rng = 0x9e3779b97f4a7c15ull;
+  for (auto &b : lane_bytes) {
+    rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+    b = static_cast<std::uint8_t>(rng);
+  }
+  static constexpr std::array<std::size_t, 8> chunk_pattern = {1, 3, 16, 64, 2, 31, 7, 63};
+  alignas(64) std::array<std::uint32_t, 16 * 16> words;
+  std::array<Digest, 16> digests{};
+  Md5Scratch scratch;
+  std::size_t failures = 0;
+  for (std::size_t len = 0; len <= kMaxLen; ++len) {
+    Md5Avx512Ctx ctx;
+    md5_avx512_init(ctx);
+    std::size_t offset = 0, step = 0;
+    while (offset < len) {
+      const auto chunk = std::min(chunk_pattern[step++ % chunk_pattern.size()], len - offset);
+      words.fill(0);
+      for (unsigned lane = 0; lane != 16; ++lane) {
+        std::uint32_t tmp[16]{};
+        std::memcpy(tmp, lane_bytes.data() + lane * kMaxLen + offset, chunk);
+        for (unsigned word = 0; word != 16; ++word) words[word * 16 + lane] = tmp[word];
+      }
+      md5_avx512_update_64(ctx, words.data(), static_cast<std::uint32_t>(chunk));
+      offset += chunk;
+    }
+    md5_avx512_final(ctx);
+    md5_avx512_store(ctx, digests);
+    for (unsigned lane = 0; lane != 16; ++lane) {
+      const auto want = md5(std::span<const std::uint8_t>(lane_bytes.data() + lane * kMaxLen, len), scratch);
+      if (digests[lane] != want) {
+        ++failures;
+        std::cerr << paint("selftest 失败：", Ansi::red, c.color) << "长度 " << len << "，lane " << lane << '\n';
+      }
+    }
+  }
+  if (failures) return 1;
+  std::cerr << paint("selftest：", Ansi::green, c.color) << "0.." << kMaxLen << " 字节 × 16 路流式多块 MD5 与标量实现全部一致\n";
+
+  // Chained word-major transform (search hot path) against scalar MD5.
+  std::vector<std::uint32_t> mw;
+  std::array<std::uint32_t, 64> h;
+  for (std::size_t len = 0; len <= kMaxLen; ++len) {
+    const std::size_t blocks = (len + 9 + 63) / 64;
+    mw.assign(blocks * 16 * 16, 0);
+    const std::uint64_t bits = static_cast<std::uint64_t>(len) * 8;
+    for (unsigned lane = 0; lane != 16; ++lane) {
+      for (std::size_t p = 0; p != len; ++p) {
+        auto &w = mw[(p / 64) * 256 + ((p % 64) / 4) * 16 + lane];
+        w |= static_cast<std::uint32_t>(lane_bytes[lane * kMaxLen + p]) << (8 * (p % 4));
+      }
+      mw[(len / 64) * 256 + ((len % 64) / 4) * 16 + lane] |= 0x80u << (8 * (len % 4));
+      mw[(blocks - 1) * 256 + 14 * 16 + lane] = static_cast<std::uint32_t>(bits);
+      mw[(blocks - 1) * 256 + 15 * 16 + lane] = static_cast<std::uint32_t>(bits >> 32);
+    }
+    md5_avx512_transform_blocks(mw.data(), blocks, h.data());
+    for (unsigned lane = 0; lane != 16; ++lane) {
+      Digest got;
+      lane_digest(h.data(), lane, got);
+      const auto want = md5(std::span<const std::uint8_t>(lane_bytes.data() + lane * kMaxLen, len), scratch);
+      if (got != want) {
+        ++failures;
+        std::cerr << paint("selftest 失败：", Ansi::red, c.color) << "transform_blocks 长度 " << len << "，lane " << lane << '\n';
+      }
+    }
+  }
+  if (failures) return 1;
+  std::cerr << paint("selftest：", Ansi::green, c.color) << "0.." << kMaxLen << " 字节 × 16 路链式多块与标量实现全部一致\n";
+
+  // Vectorized match / PHP-magic masks against their scalar counterparts.
+  const std::size_t last_blocks = (kMaxLen + 9 + 63) / 64;
+  md5_avx512_transform_blocks(mw.data(), last_blocks, h.data());  // reuse len = kMaxLen batch
+  std::array<Digest, 16> ref{};
+  for (unsigned lane = 0; lane != 16; ++lane) lane_digest(h.data(), lane, ref[lane]);
+  for (unsigned round = 0; round != 64; ++round) {
+    const auto canonical = hex(ref[3], false);
+    std::string pattern = canonical;
+    for (auto &ch : pattern) {
+      rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+      if (rng % 3 == 0) ch = '?';
+    }
+    const auto spec = make_match_spec(false, Digest{}, pattern);
+    const auto mask = md5_avx512_match_mask(h.data(), spec);
+    for (unsigned lane = 0; lane != 16; ++lane) {
+      const bool want = matches_pattern(ref[lane], pattern);
+      if (((mask >> lane) & 1) != static_cast<std::uint32_t>(want)) {
+        ++failures;
+        std::cerr << paint("selftest 失败：", Ansi::red, c.color) << "match_mask pattern " << pattern << "，lane " << lane << '\n';
+      }
+    }
+    if (!(mask & (1u << 3))) { ++failures; std::cerr << paint("selftest 失败：", Ansi::red, c.color) << "match_mask 漏报自身\n"; }
+  }
+  {
+    const auto spec = make_match_spec(true, ref[7], "");
+    const auto mask = md5_avx512_match_mask(h.data(), spec);
+    if (mask != (1u << 7)) { ++failures; std::cerr << paint("selftest 失败：", Ansi::red, c.color) << "match_mask target 应为 lane 7\n"; }
+  }
+  {
+    // lane 0: 合法 magic hash；lane 1: 含非数字 nibble；lane 2: 首字节非 0e
+    std::array<std::uint32_t, 64> mh{};
+    for (unsigned b = 0; b != 16; ++b) {
+      mh[(b / 4) * 16 + 0] |= (b == 0 ? 0x0eu : 0x11u) << (8 * (b % 4));
+      mh[(b / 4) * 16 + 1] |= (b == 0 ? 0x0eu : (b == 15 ? 0x1au : 0x11u)) << (8 * (b % 4));
+      mh[(b / 4) * 16 + 2] |= (b == 0 ? 0x1eu : 0x11u) << (8 * (b % 4));
+    }
+    const auto mask = md5_avx512_php_magic_mask(mh.data());
+    if (mask != 1u) { ++failures; std::cerr << paint("selftest 失败：", Ansi::red, c.color) << "php_magic_mask 应为 0x1，实际 " << std::hex << mask << std::dec << '\n'; }
+  }
+  if (failures) return 1;
+  std::cerr << paint("selftest：", Ansi::green, c.color) << "match_mask / php_magic_mask 与标量判定一致\n";
+  return 0;
+}
+
 int run(const Config &c) {
+  if (c.mode == Config::Mode::Selftest) return run_selftest(c);
   if (c.mode == Config::Mode::Benchmark) return run_benchmark(c);
   if (c.mode == Config::Mode::Hash) {
     const auto d = md5(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t *>(c.text.data()), c.text.size()));
@@ -561,9 +809,17 @@ int run(const Config &c) {
   interrupted.store(false, std::memory_order_relaxed);
   const std::string target = c.target.empty() ? std::string{} : normalize_digest(c.target);
   const std::string pattern = normalize_pattern(c.pattern);
+  Digest target_digest{};
+  const bool has_target = !target.empty();
+  for (unsigned i = 0; has_target && i != 16; ++i)
+    target_digest[i] = static_cast<std::uint8_t>(std::stoul(target.substr(2 * i, 2), nullptr, 16));
   if (c.mode == Config::Mode::Prefix && (c.weak_hex == 0 || c.weak_hex > 32)) usage_error("weak-hex 必须在 1 到 32 之间");
   auto space = make_space(c); if (space.total == 0) return 0;
   const auto limit = std::min(space.total, c.max_candidates);
+  // LaneSearcher keeps one word-major message buffer per block; cap the SIMD
+  // path so absurdly long candidates fall back to the scalar multi-block loop.
+  const bool use_simd = c.simd && c.length <= 65535 && md5_avx512_available();
+  const auto match_spec = make_match_spec(has_target, target_digest, pattern);
   std::atomic<std::uint64_t> next{0};
   std::atomic<bool> stop{false};
   std::atomic<bool> found{false};
@@ -575,48 +831,87 @@ int run(const Config &c) {
   std::array<std::mutex, 32> locks;
   const unsigned thread_count = static_cast<unsigned>(std::min<std::uint64_t>(c.threads, std::max<std::uint64_t>(1, limit)));
   for (unsigned t = 0; t < thread_count; ++t) workers.emplace_back([&](std::stop_token token) {
-    std::vector<std::uint8_t> candidate; candidate.reserve(c.length);
+    Cursor cursor;
     Md5Scratch scratch;
-    while (!token.stop_requested() && !stop.load(std::memory_order_relaxed) && !interrupted.load(std::memory_order_relaxed)) {
-      const auto begin = next.fetch_add(256, std::memory_order_relaxed); if (begin >= limit) break;
-      const auto end = std::min<std::uint64_t>(limit, begin + 256);
-      for (auto i = begin; i < end && !stop.load(std::memory_order_relaxed) && !interrupted.load(std::memory_order_relaxed); ++i) {
-        decode(i, space, candidate); const auto d = md5(candidate, scratch);
-        if (c.mode == Config::Mode::Match) {
-          const auto canonical = hex(d, false);
-          const auto ds = hex(d, c.upper_output);
-          if ((!target.empty() && canonical == target) || (target.empty() && matches_pattern(canonical, pattern))) {
-            const auto ordinal = output_count.fetch_add(1, std::memory_order_relaxed);
-            if (ordinal < c.max_output) {
-              std::scoped_lock lock(output_mutex);
-              std::cout << ds << "  " << std::string(candidate.begin(), candidate.end()) << '\n';
-              if (ordinal + 1 >= c.max_output) {
-                output_limit_hit.store(true, std::memory_order_relaxed);
-                stop.store(true, std::memory_order_relaxed);
-              }
-            } else {
+    std::optional<LaneSearcher> lanes;
+    if (use_simd) lanes.emplace(space);
+    std::array<std::uint32_t, 64> h;
+    auto handle = [&](const std::uint8_t *data, std::size_t len, const Digest &d) {
+      if (c.mode == Config::Mode::Match) {
+        if ((has_target && d == target_digest) || (!has_target && matches_pattern(d, pattern))) {
+          const auto ordinal = output_count.fetch_add(1, std::memory_order_relaxed);
+          if (ordinal < c.max_output) {
+            std::scoped_lock lock(output_mutex);
+            std::cout << hex(d, c.upper_output) << "  " << std::string(reinterpret_cast<const char *>(data), len) << '\n';
+            if (ordinal + 1 >= c.max_output) {
               output_limit_hit.store(true, std::memory_order_relaxed);
               stop.store(true, std::memory_order_relaxed);
             }
-          }
-        } else {
-          const auto candidate_text = std::string(candidate.begin(), candidate.end());
-          const auto canonical = hex(d, false);
-          if (c.mode == Config::Mode::PhpWeak && !is_php_magic_hash(canonical)) continue;
-          const auto key = c.mode == Config::Mode::Prefix ? collision_key(d, c.weak_hex) : (c.mode == Config::Mode::PhpWeak ? Digest{} : d);
-          const auto shard = KeyHash{}(key) & 31u;
-          std::scoped_lock lock(locks[shard]); auto [it, inserted] = tables[shard].try_emplace(key, Seen{candidate_text, d});
-          if (!inserted && it->second.candidate != candidate_text) {
+          } else {
+            output_limit_hit.store(true, std::memory_order_relaxed);
             stop.store(true, std::memory_order_relaxed);
-            if (!found.exchange(true, std::memory_order_acq_rel)) {
-              std::scoped_lock out_lock(output_mutex);
-              const auto label = c.mode == Config::Mode::PhpWeak ? "PHP 弱碰撞" : (c.mode == Config::Mode::Prefix ? "前缀碰撞" : "真碰撞");
-              std::cout << paint(label, Ansi::yellow, c.color) << '\n'
-                        << "  A: " << paint(hex(it->second.digest, c.upper_output), Ansi::cyan, c.color) << "  " << paint(it->second.candidate, Ansi::green, c.color) << '\n'
-                        << "  B: " << paint(hex(d, c.upper_output), Ansi::cyan, c.color) << "  " << paint(candidate_text, Ansi::green, c.color) << '\n';
-            }
           }
         }
+      } else {
+        if (c.mode == Config::Mode::PhpWeak && !is_php_magic_hash(d)) return;
+        const auto candidate_text = std::string(reinterpret_cast<const char *>(data), len);
+        const auto key = c.mode == Config::Mode::Prefix ? collision_key(d, c.weak_hex) : (c.mode == Config::Mode::PhpWeak ? Digest{} : d);
+        const auto shard = KeyHash{}(key) & 31u;
+        std::scoped_lock lock(locks[shard]); auto [it, inserted] = tables[shard].try_emplace(key, Seen{candidate_text, d});
+        if (!inserted && it->second.candidate != candidate_text) {
+          stop.store(true, std::memory_order_relaxed);
+          if (!found.exchange(true, std::memory_order_acq_rel)) {
+            std::scoped_lock out_lock(output_mutex);
+            const auto label = c.mode == Config::Mode::PhpWeak ? "PHP 弱碰撞" : (c.mode == Config::Mode::Prefix ? "前缀碰撞" : "真碰撞");
+            std::cout << paint(label, Ansi::yellow, c.color) << '\n'
+                      << "  A: " << paint(hex(it->second.digest, c.upper_output), Ansi::cyan, c.color) << "  " << paint(it->second.candidate, Ansi::green, c.color) << '\n'
+                      << "  B: " << paint(hex(d, c.upper_output), Ansi::cyan, c.color) << "  " << paint(candidate_text, Ansi::green, c.color) << '\n';
+          }
+        }
+      }
+    };
+    while (!token.stop_requested() && !stop.load(std::memory_order_relaxed) && !interrupted.load(std::memory_order_relaxed)) {
+      const auto begin = next.fetch_add(256, std::memory_order_relaxed); if (begin >= limit) break;
+      const auto end = std::min<std::uint64_t>(limit, begin + 256);
+      auto i = begin;
+      if (use_simd) {
+        lanes->seek(begin, cursor);
+        for (; i + 16 <= end && !stop.load(std::memory_order_relaxed) && !interrupted.load(std::memory_order_relaxed); i += 16) {
+          md5_avx512_transform_blocks(lanes->mw.data(), lanes->blocks, h.data());
+          if (c.mode == Config::Mode::Match) {
+            for (auto m = md5_avx512_match_mask(h.data(), match_spec); m; m &= m - 1) {
+              const unsigned lane = static_cast<unsigned>(std::countr_zero(m));
+              Digest d;
+              lane_digest(h.data(), lane, d);
+              const auto text = lane_candidate(*lanes, lane);
+              handle(reinterpret_cast<const std::uint8_t *>(text.data()), text.size(), d);
+            }
+          } else if (c.mode == Config::Mode::PhpWeak) {
+            for (auto m = md5_avx512_php_magic_mask(h.data()); m; m &= m - 1) {
+              const unsigned lane = static_cast<unsigned>(std::countr_zero(m));
+              Digest d;
+              lane_digest(h.data(), lane, d);
+              const auto text = lane_candidate(*lanes, lane);
+              handle(reinterpret_cast<const std::uint8_t *>(text.data()), text.size(), d);
+            }
+          } else {
+            for (unsigned lane = 0; lane != 16; ++lane) {
+              Digest d;
+              lane_digest(h.data(), lane, d);
+              const auto text = lane_candidate(*lanes, lane);
+              handle(reinterpret_cast<const std::uint8_t *>(text.data()), text.size(), d);
+            }
+          }
+          for (unsigned lane = 0; lane != 16; ++lane) lanes->advance_lane(lane, cursor);
+        }
+        if (i < end) seek_cursor(cursor, i, space);
+      } else {
+        seek_cursor(cursor, begin, space);
+      }
+      for (; i < end && !stop.load(std::memory_order_relaxed) && !interrupted.load(std::memory_order_relaxed); ++i) {
+        const auto d = md5(cursor.candidate, scratch);
+        handle(cursor.candidate.data(), cursor.candidate.size(), d);
+        advance_cursor(cursor, space);
       }
     }
   });

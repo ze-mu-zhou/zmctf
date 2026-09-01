@@ -33,29 +33,9 @@ constexpr std::array<unsigned, 64> SHIFT = {
     4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
     6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21};
 
-} // namespace
-
-void md5_avx512_16(std::span<const std::array<std::uint8_t, 56>, 16> inputs,
-                   std::size_t length, std::array<Md5Digest, 16> &outputs) {
-  alignas(64) std::uint32_t lane_words[16][16]{};
-  for (unsigned lane = 0; lane != 16; ++lane) {
-    std::memcpy(lane_words[lane], inputs[lane].data(), length);
-    auto *bytes = reinterpret_cast<std::uint8_t *>(lane_words[lane]);
-    bytes[length] = 0x80;
-    const auto bits = static_cast<std::uint64_t>(length) * 8;
-    lane_words[lane][14] = static_cast<std::uint32_t>(bits);
-    lane_words[lane][15] = static_cast<std::uint32_t>(bits >> 32);
-  }
-  __m512i m[16];
-  alignas(64) std::uint32_t packed[16];
-  for (unsigned word = 0; word != 16; ++word) {
-    for (unsigned lane = 0; lane != 16; ++lane) packed[lane] = lane_words[lane][word];
-    m[word] = _mm512_load_si512(packed);
-  }
-  __m512i a = _mm512_set1_epi32(0x67452301u);
-  __m512i b = _mm512_set1_epi32(0xefcdab89u);
-  __m512i c = _mm512_set1_epi32(0x98badcfeu);
-  __m512i d = _mm512_set1_epi32(0x10325476u);
+// One MD5 compression over 16 lanes; h carries the chaining state in and out.
+void transform_16(const __m512i m[16], __m512i h[4]) noexcept {
+  __m512i a = h[0], b = h[1], c = h[2], d = h[3];
   for (unsigned i = 0; i != 64; ++i) {
     __m512i f, g;
     if (i < 16) { f = _mm512_or_si512(_mm512_and_si512(b, c), _mm512_andnot_si512(b, d)); g = m[i]; }
@@ -67,23 +47,170 @@ void md5_avx512_16(std::span<const std::array<std::uint8_t, 56>, 16> inputs,
     const auto next = _mm512_add_epi32(b, rotated);
     a = d; d = c; c = b; b = next;
   }
-  a = _mm512_add_epi32(a, _mm512_set1_epi32(0x67452301u));
-  b = _mm512_add_epi32(b, _mm512_set1_epi32(0xefcdab89u));
-  c = _mm512_add_epi32(c, _mm512_set1_epi32(0x98badcfeu));
-  d = _mm512_add_epi32(d, _mm512_set1_epi32(0x10325476u));
-  alignas(64) std::uint32_t state[4][16];
-  _mm512_store_si512(state[0], a); _mm512_store_si512(state[1], b);
-  _mm512_store_si512(state[2], c); _mm512_store_si512(state[3], d);
+  h[0] = _mm512_add_epi32(h[0], a);
+  h[1] = _mm512_add_epi32(h[1], b);
+  h[2] = _mm512_add_epi32(h[2], c);
+  h[3] = _mm512_add_epi32(h[3], d);
+}
+
+// hashcat hc_bytealign (inc_common.cl): (b << 8*(c&3)) | (a >> (32 - 8*(c&3)))
+__m512i bytealign(__m512i a, __m512i b, unsigned c) noexcept {
+  const unsigned s = (c & 3u) * 8u;
+  if (s == 0) return b;
+  return _mm512_or_si512(_mm512_slli_epi32(b, s), _mm512_srli_epi32(a, 32 - s));
+}
+
+// hashcat switch_buffer_by_offset_le: shift the 64-byte buffer right by `offset` bytes
+void switch_buffer_by_offset(__m512i w[16], unsigned offset) noexcept {
+  const unsigned words = offset / 4;
+  const __m512i z = _mm512_setzero_si512();
+  __m512i t[16];
+  for (int i = 15; i >= 0; --i) {
+    const int src = i - static_cast<int>(words);
+    const __m512i b = src >= 0 ? w[src] : z;
+    const __m512i a = src >= 1 ? w[src - 1] : z;
+    t[i] = bytealign(a, b, offset);
+  }
+  std::memcpy(w, t, sizeof t);
+}
+
+// hashcat switch_buffer_by_offset_carry_le: same shift, overflow lands in c
+void switch_buffer_by_offset_carry(__m512i w[16], __m512i c[16], unsigned offset) noexcept {
+  const unsigned words = offset / 4;
+  const __m512i z = _mm512_setzero_si512();
+  __m512i t[32];
+  for (int i = 31; i >= 0; --i) {
+    const int src = i - static_cast<int>(words);
+    const __m512i b = (src >= 0 && src < 16) ? w[src] : z;
+    const __m512i a = (src >= 1 && src <= 16) ? w[src - 1] : z;
+    t[i] = bytealign(a, b, offset);
+  }
+  std::memcpy(w, t, 16 * sizeof(__m512i));
+  std::memcpy(c, t + 16, 16 * sizeof(__m512i));
+}
+
+void load_h(const Md5Avx512Ctx &ctx, __m512i h[4]) noexcept {
+  for (unsigned i = 0; i != 4; ++i) h[i] = _mm512_load_si512(ctx.h.data() + i * 16);
+}
+
+void store_h(Md5Avx512Ctx &ctx, const __m512i h[4]) noexcept {
+  for (unsigned i = 0; i != 4; ++i) _mm512_store_si512(ctx.h.data() + i * 16, h[i]);
+}
+
+} // namespace
+
+void md5_avx512_transform_blocks(const std::uint32_t *mw, std::size_t blocks,
+                                 std::uint32_t *h_out) noexcept {
+  __m512i h[4] = {_mm512_set1_epi32(0x67452301u), _mm512_set1_epi32(0xefcdab89u),
+                  _mm512_set1_epi32(0x98badcfeu), _mm512_set1_epi32(0x10325476u)};
+  __m512i m[16];
+  for (std::size_t block = 0; block != blocks; ++block) {
+    for (unsigned word = 0; word != 16; ++word)
+      m[word] = _mm512_loadu_si512(mw + block * 256 + word * 16);
+    transform_16(m, h);
+  }
+  for (unsigned word = 0; word != 4; ++word) _mm512_storeu_si512(h_out + word * 16, h[word]);
+}
+
+std::uint32_t md5_avx512_match_mask(const std::uint32_t *h, const Md5Avx512Match &m) noexcept {
+  __mmask16 r = 0xffff;
+  for (unsigned b = 0; b != 16 && r; ++b) {
+    if (!m.mask[b]) continue;
+    const __m512i v = _mm512_and_si512(
+        _mm512_srli_epi32(_mm512_loadu_si512(h + (b / 4) * 16), 8 * (b % 4)),
+        _mm512_set1_epi32(0xff));
+    const __mmask16 eq = _mm512_cmpeq_epi32_mask(
+        _mm512_and_si512(v, _mm512_set1_epi32(m.mask[b])),
+        _mm512_set1_epi32(m.value[b] & m.mask[b]));
+    r &= eq;
+  }
+  return r;
+}
+
+std::uint32_t md5_avx512_php_magic_mask(const std::uint32_t *h) noexcept {
+  const __m512i w0 = _mm512_loadu_si512(h);
+  __mmask16 r = _mm512_cmpeq_epi32_mask(_mm512_and_si512(w0, _mm512_set1_epi32(0xff)),
+                                        _mm512_set1_epi32(0x0e));
+  const __m512i nine = _mm512_set1_epi32(9);
+  for (unsigned b = 1; b != 16 && r; ++b) {
+    const __m512i v = _mm512_and_si512(
+        _mm512_srli_epi32(_mm512_loadu_si512(h + (b / 4) * 16), 8 * (b % 4)),
+        _mm512_set1_epi32(0xff));
+    r &= _mm512_cmple_epu32_mask(_mm512_srli_epi32(v, 4), nine) &
+         _mm512_cmple_epu32_mask(_mm512_and_si512(v, _mm512_set1_epi32(0xf)), nine);
+  }
+  return r;
+}
+
+void md5_avx512_init(Md5Avx512Ctx &ctx) noexcept {
+  ctx.len = 0;
+  ctx.w.fill(0);
+  for (unsigned lane = 0; lane != 16; ++lane) {
+    ctx.h[0 * 16 + lane] = 0x67452301u;
+    ctx.h[1 * 16 + lane] = 0xefcdab89u;
+    ctx.h[2 * 16 + lane] = 0x98badcfeu;
+    ctx.h[3 * 16 + lane] = 0x10325476u;
+  }
+}
+
+void md5_avx512_update_64(Md5Avx512Ctx &ctx, const std::uint32_t *words, std::uint32_t len) noexcept {
+  if (len == 0) return;
+  __m512i h[4], in[16];
+  load_h(ctx, h);
+  for (unsigned i = 0; i != 16; ++i) in[i] = _mm512_load_si512(words + i * 16);
+  const unsigned pos = static_cast<unsigned>(ctx.len & 63u);
+  ctx.len += len;
+  if (pos == 0) {
+    if (len == 64) {
+      transform_16(in, h);
+      ctx.w.fill(0);
+    } else {
+      for (unsigned i = 0; i != 16; ++i) _mm512_store_si512(ctx.w.data() + i * 16, in[i]);
+    }
+  } else if (pos + len < 64) {
+    switch_buffer_by_offset(in, pos);
+    for (unsigned i = 0; i != 16; ++i)
+      _mm512_store_si512(ctx.w.data() + i * 16,
+                         _mm512_or_si512(_mm512_load_si512(ctx.w.data() + i * 16), in[i]));
+  } else {
+    __m512i w[16], carry[16];
+    for (unsigned i = 0; i != 16; ++i) carry[i] = _mm512_setzero_si512();
+    switch_buffer_by_offset_carry(in, carry, pos);
+    for (unsigned i = 0; i != 16; ++i)
+      w[i] = _mm512_or_si512(_mm512_load_si512(ctx.w.data() + i * 16), in[i]);
+    transform_16(w, h);
+    for (unsigned i = 0; i != 16; ++i) _mm512_store_si512(ctx.w.data() + i * 16, carry[i]);
+  }
+  store_h(ctx, h);
+}
+
+void md5_avx512_final(Md5Avx512Ctx &ctx) noexcept {
+  __m512i h[4], w[16];
+  load_h(ctx, h);
+  for (unsigned i = 0; i != 16; ++i) w[i] = _mm512_load_si512(ctx.w.data() + i * 16);
+  const unsigned pos = static_cast<unsigned>(ctx.len & 63u);
+  w[pos / 4] = _mm512_or_si512(w[pos / 4], _mm512_set1_epi32(static_cast<int>(0x80u << (8 * (pos % 4)))));
+  if (pos >= 56) {
+    transform_16(w, h);
+    for (unsigned i = 0; i != 16; ++i) w[i] = _mm512_setzero_si512();
+  }
+  const std::uint64_t bits = ctx.len * 8;
+  w[14] = _mm512_set1_epi32(static_cast<std::uint32_t>(bits));
+  w[15] = _mm512_set1_epi32(static_cast<std::uint32_t>(bits >> 32));
+  transform_16(w, h);
+  store_h(ctx, h);
+}
+
+void md5_avx512_store(const Md5Avx512Ctx &ctx, std::array<Md5Digest, 16> &outputs) noexcept {
   for (unsigned lane = 0; lane != 16; ++lane) {
     auto &out = outputs[lane];
-    out[0] = static_cast<std::uint8_t>(state[0][lane]); out[1] = static_cast<std::uint8_t>(state[0][lane] >> 8);
-    out[2] = static_cast<std::uint8_t>(state[0][lane] >> 16); out[3] = static_cast<std::uint8_t>(state[0][lane] >> 24);
-    out[4] = static_cast<std::uint8_t>(state[1][lane]); out[5] = static_cast<std::uint8_t>(state[1][lane] >> 8);
-    out[6] = static_cast<std::uint8_t>(state[1][lane] >> 16); out[7] = static_cast<std::uint8_t>(state[1][lane] >> 24);
-    out[8] = static_cast<std::uint8_t>(state[2][lane]); out[9] = static_cast<std::uint8_t>(state[2][lane] >> 8);
-    out[10] = static_cast<std::uint8_t>(state[2][lane] >> 16); out[11] = static_cast<std::uint8_t>(state[2][lane] >> 24);
-    out[12] = static_cast<std::uint8_t>(state[3][lane]); out[13] = static_cast<std::uint8_t>(state[3][lane] >> 8);
-    out[14] = static_cast<std::uint8_t>(state[3][lane] >> 16); out[15] = static_cast<std::uint8_t>(state[3][lane] >> 24);
+    for (unsigned word = 0; word != 4; ++word) {
+      const auto v = ctx.h[word * 16 + lane];
+      out[word * 4 + 0] = static_cast<std::uint8_t>(v);
+      out[word * 4 + 1] = static_cast<std::uint8_t>(v >> 8);
+      out[word * 4 + 2] = static_cast<std::uint8_t>(v >> 16);
+      out[word * 4 + 3] = static_cast<std::uint8_t>(v >> 24);
+    }
   }
 }
 
@@ -103,7 +230,13 @@ bool md5_avx512_available() noexcept {
 
 #else
 
-void md5_avx512_16(std::span<const std::array<std::uint8_t, 56>, 16>, std::size_t, std::array<Md5Digest, 16> &) {}
+void md5_avx512_transform_blocks(const std::uint32_t *, std::size_t, std::uint32_t *) noexcept {}
+std::uint32_t md5_avx512_match_mask(const std::uint32_t *, const Md5Avx512Match &) noexcept { return 0; }
+std::uint32_t md5_avx512_php_magic_mask(const std::uint32_t *) noexcept { return 0; }
+void md5_avx512_init(Md5Avx512Ctx &) noexcept {}
+void md5_avx512_update_64(Md5Avx512Ctx &, const std::uint32_t *, std::uint32_t) noexcept {}
+void md5_avx512_final(Md5Avx512Ctx &) noexcept {}
+void md5_avx512_store(const Md5Avx512Ctx &, std::array<Md5Digest, 16> &) noexcept {}
 bool md5_avx512_available() noexcept { return false; }
 
 #endif
