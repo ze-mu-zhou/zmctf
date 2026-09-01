@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -197,6 +198,7 @@ typedef unsigned int u32;
 typedef unsigned long u64;
 
 inline uvec zm_rotl(const uvec x, const u32 s) { return (x << s) | (x >> (32 - s)); }
+inline uvec zm_rotr(const uvec x, const u32 s) { return (x >> s) | (x << (32 - s)); }
 inline u32 zm_rotr32(const u32 x, const u32 s) { return (x >> s) | (x << (32 - s)); }
 inline uvec zm_splat(const u32 x) { return (uvec) (SPLAT_ARGS); }
 
@@ -235,10 +237,12 @@ __kernel void zm_md5_match(
 //    a host-precomputed OR table, VEC candidates per thread (u32x8 ILP);
 //  - every fixed message word is folded into a per-step constant K+w (the
 //    F_w1c01 = w[1] + MD5C01 trick), so steps are add+fn+rotl+add only;
-//  - for exact 128-bit targets, round 4 (steps 63..49) is reversed from the
-//    target once per thread, and the forward loop stops after step 45: the
-//    reversed d-component (d45) is a w0-independent exact constant, so the
-//    early reject costs one vector compare (~28% less work per candidate);
+//  - for exact 128-bit targets, steps 63..49 are reversed from the target
+//    once per thread, then step 48 (the first w0-consuming step) minus its
+//    w0 term and step 47's constant part are folded in too; inside the loop
+//    the reversed b43 chain costs 4 vector ops (sub, xor, sub, sub), so the
+//    forward loop stops after step 43 and the early reject fires two steps
+//    earlier (~31% less work per candidate);
 //    survivors recompute the tail and take a full masked compare.
 //  - masked (pattern) targets cannot be reversed, so they run all 64 steps.
 std::string build_kernel_source(std::size_t length, bool exact) {
@@ -306,19 +310,34 @@ std::string build_kernel_source(std::size_t length, bool exact) {
                     rvars[(t + 1) % 4], rvars[(t + 2) % 4], rvars[(t + 3) % 4], term.c_str(), MD5_K[i]);
       s += line;
     }
-    // After undoing steps 63..49 the reversed state is exact: its d-component
-    // (rd = d45) lets the forward loop bail right after step 45, before the
-    // w0-dependent step 48 makes deeper static reversal impossible.
+    // After undoing steps 63..49, (ra, rb, rc, rd) = (V48, V47, V46, V45).
+    // Push the reject two steps deeper, across the w0-consuming step 48:
+    //   V44 = rotr(V48 - V47, 6) - I(V47, V46, V45) - w0 - K48
+    //   V43 = rotr(V47 - V46, 23) - (V44 ^ V45 ^ V46) - w2 - K47
+    // Everything except w0 is a per-thread constant, so the loop only needs
+    //   t44 = v44p - w0
+    //   t43 = rv46 - (t44 ^ x46) - (K47 + w2)
+    // to compare against the forward b right after step 43.
+    s += "  const u32 v44p = zm_rotr32(ra - rb, 6u) - ZM_I(rb, rc, rd) - 0xf4292244u;\n";
+    s += "  const u32 rv46 = zm_rotr32(rb - rc, 23u);\n";
+    s += "  const u32 x46 = rc ^ rd;\n";
   }
 
   s += "\n  const " + vec_t + " save_w0 = zm_splat(w0_s);\n";
   s += "  for (u32 it = 0; it < nvec; ++it) {\n";
   s += "    const u32 base_i = it * " + std::to_string(VEC) + "u;\n";
   s += "    const " + vec_t + " w0v = save_w0 | inner_tab[it];\n";
+  if (exact) {
+    // b43 reject chain (see the reversal notes above); kc47 already holds
+    // K47 + w2 whenever word 2 is non-zero, otherwise w2 = 0.
+    const std::string k47 = zero[2] ? "0xc4ac5665u" : "kc47";
+    s += "    const " + vec_t + " t44 = zm_splat(v44p) - w0v;\n";
+    s += "    const " + vec_t + " t43 = zm_splat(rv46) - (t44 ^ zm_splat(x46)) - zm_splat(" + k47 + ");\n";
+  }
   s += "    " + vec_t + " a = zm_splat(0x67452301u), b = zm_splat(0xefcdab89u);\n";
   s += "    " + vec_t + " c = zm_splat(0x98badcfeu), d = zm_splat(0x10325476u);\n";
 
-  const unsigned forward_end = exact ? 46 : 64;
+  const unsigned forward_end = exact ? 44 : 64;
   const auto emit_step = [&](unsigned i) {
     const unsigned t = (4 - (i % 4)) % 4;
     const unsigned g = md5_word(i);
@@ -352,10 +371,10 @@ std::string build_kernel_source(std::size_t length, bool exact) {
   };
 
   if (exact) {
-    // Early reject: after step 45, the d-component must equal the reversed d45.
-    s += "    const " + int_t + " early = (d == zm_splat(rd));\n";
+    // Early reject: after step 43, b must equal the reversed b43 chain value.
+    s += "    const " + int_t + " early = (b == t43);\n";
     s += "    if (any(early)) {\n";
-    for (unsigned i = 46; i != 64; ++i) {
+    for (unsigned i = 44; i != 64; ++i) {
       // Continuation steps, indented one level deeper.
       const unsigned t = (4 - (i % 4)) % 4;
       const unsigned g = md5_word(i);
@@ -484,6 +503,9 @@ GpuMatchResult gpu_match(const GpuMatchParams &params) {
       std::clamp<std::uint64_t>((std::uint64_t{1} << 30) / inner_count, 1, 262144);
 
   const std::string source = build_kernel_source(L, exact);
+  if (const char *dump = std::getenv("ZM_DUMP_KERNEL"); dump && *dump) {
+    if (FILE *f = std::fopen(dump, "w")) { std::fwrite(source.data(), 1, source.size(), f); std::fclose(f); }
+  }
 
   cl_int err = CL_SUCCESS;
   cl_context context = cl.CreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
