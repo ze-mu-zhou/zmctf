@@ -110,13 +110,42 @@ check("T9b-bad-sig-b64", r.returncode == 1)
 r = run("flask", "decode", "--cookie", "!!!.GVj.c2ln")
 check("T9c-bad-payload-b64", r.returncode == 1)
 
-# ---- T10: --threads 非法值 ----
+# ---- T10: --threads 严格解析,边界校验不创建大量线程 ----
 c = ser("dragon").dumps({"f": 1})
-with open(WL, "w") as f: f.write("wrong\ndragon\n")
-for bad in ("abc", "-5"):
-    r = run("flask", "crack", "--cookie", c, "--wordlist", WL, "--threads", bad, "--engine", "cpu")
-    check(f"T10-threads-{bad}", r.returncode == 0 and r.stdout.strip() == "dragon")
-os.unlink(WL)
+base = ["flask", "crack", "--cookie", c, "--mask", "dragon", "--engine", "cpu"]
+for bad in ("abc", "-5", "-1", "8abc", "1.5", "1025", "100000",
+            "999999999999999999999999", " 8", "8 ", "+8", ""):
+    r = run(*base, "--threads", bad)
+    check(f"T10-threads-reject-{bad!r}",
+          r.returncode == 2 and "--threads" in r.stderr and not r.stdout.strip())
+for extra in (["--threads"], ["--threads", "--salt", "cookie-session"],
+              ["--threads", "2", "--threads", "abc"]):
+    r = run(*base, *extra)
+    check(f"T10-threads-reject-{extra!r}",
+          r.returncode == 2 and "--threads" in r.stderr and not r.stdout.strip())
+for extra in ([], ["--threads", "0"], ["--threads", "1"], ["--threads", "2"]):
+    r = run(*base, *extra)
+    check(f"T10-threads-accept-{extra!r}", r.returncode == 0 and r.stdout.strip() == "dragon")
+
+# decode 共用参数解析但不会启动线程,安全验证上限及上限前一位。
+for value in ("1023", "1024"):
+    r = run("flask", "decode", "--cookie", c, "--threads", value)
+    check(f"T10-threads-upper-{value}", r.returncode == 0 and json.loads(r.stdout) == {"f": 1})
+
+# 单条参数错误后,常驻进程仍能执行下一条合法命令。
+commands = [base + ["--threads", "8abc"], base + ["--threads", "1"]]
+r = subprocess.run([TOOL, "serve"], input="".join(json.dumps(cmd) + "\n" for cmd in commands),
+                   capture_output=True, text=True, encoding="utf-8", timeout=15)
+sentinels = [line for line in r.stdout.splitlines() if line.startswith("<<<zk-rc=")]
+check("T10-threads-serve-recovery", r.returncode == 0 and
+      sentinels == ["<<<zk-rc=2>>>", "<<<zk-rc=0>>>"] and "dragon" in r.stdout.splitlines())
+
+# 交互模式复用相同解析,错误返回菜单并能正常退出。
+answers = "\n".join(["4", c, "2", "dragon", "", "cpu", "8abc", "0", ""])
+r = subprocess.run([TOOL, "interactive"], input=answers, capture_output=True,
+                   text=True, encoding="utf-8", timeout=15)
+check("T10-threads-interactive-reject", r.returncode == 0 and
+      "--threads" in r.stderr and not r.stdout.strip())
 
 # ---- T11: 空/不存在字典 ----
 open(WL, "w").close()

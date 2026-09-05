@@ -64,6 +64,49 @@ check("verify-good", r.returncode == 0 and r.stdout.strip() == "valid")
 r = run("flask", "verify", "--cookie", cookie, "--secret", "wrong")
 check("verify-bad", r.returncode == 1 and r.stdout.strip() == "invalid")
 
+# --- 2b. 压缩 timed cookie:保留前导点参与验签,覆盖字典和掩码路径 ---
+compressed_obj = {"data": "A" * 500}
+compressed_cookie = make_serializer("cmp7").dumps(compressed_obj)
+check("compressed-fixture", compressed_cookie.startswith("."))
+r = run("flask", "decode", "--cookie", compressed_cookie)
+check("compressed-decode", r.returncode == 0 and json.loads(r.stdout) == compressed_obj)
+for secret, expected in (("cmp7", "valid"), ("wrong", "invalid")):
+    r = run("flask", "verify", "--cookie", compressed_cookie, "--secret", secret)
+    check(f"compressed-verify-{expected}",
+          r.returncode == (0 if expected == "valid" else 1) and r.stdout.strip() == expected)
+
+# 去掉压缩标记后结构仍合法,但原签名必须失效。
+r = run("flask", "verify", "--cookie", compressed_cookie[1:], "--secret", "cmp7")
+check("compressed-marker-authenticated", r.returncode == 1 and r.stdout.strip() == "invalid")
+
+with open(WORDLIST, "w", encoding="utf-8") as f:
+    f.write("wrong\ncmp7\nanother\n")
+try:
+    for engine in ("cpu", "gpu", "auto"):
+        for mode, value in (("--wordlist", WORDLIST), ("--mask", "cmp?d")):
+            r = run("flask", "crack", "--cookie", compressed_cookie, mode, value,
+                    "--engine", engine, "--threads", "2")
+            check(f"compressed-crack-{engine}-{mode[2:]}",
+                  r.returncode == 0 and r.stdout.strip() == "cmp7", r.stderr.strip()[-160:])
+finally:
+    os.unlink(WORDLIST)
+
+# 拒绝空载荷/时间戳/签名和额外分隔符,包括具有正确 HMAC 的畸形结构。
+def signed_value(value):
+    dk = hmac.new(b"cmp7", b"cookie-session", hashlib.sha1).digest()
+    sig = base64.urlsafe_b64encode(hmac.new(dk, value.encode(), hashlib.sha1).digest())
+    return value + "." + sig.rstrip(b"=").decode()
+
+malformed_cookies = [signed_value(v) for v in
+                     (".AAAA", "..AAAA", "YWJj.", ".YWJj.", "YWJj.extra.AAAA",
+                      ".YWJj.extra.AAAA")]
+malformed_cookies.extend(("YWJj.AAAA.", ".YWJj.AAAA."))
+for i, malformed in enumerate(malformed_cookies):
+    for action, extra in (("verify", ["--secret", "cmp7"]),
+                          ("crack", ["--mask", "cmp7", "--engine", "cpu"])):
+        r = run("flask", action, "--cookie", malformed, *extra)
+        check(f"cookie-structure-{i}-{action}", r.returncode == 1 and not r.stdout.strip())
+
 # --- 3. sign:工具签 → Python 验 ---
 ser = make_serializer("my-secret")
 for i, obj in enumerate(cases):

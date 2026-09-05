@@ -142,6 +142,8 @@ static void usage(std::ostream& os, bool color) {
      << "  " << GN << "cuda" << R << "   仅 CUDA 后端(需 CUDA Toolkit 的 NVRTC)\n"
      << "  " << GN << "cpu" << R << "    仅 CPU(" << YE << "--threads" << R << " 控线程数)\n\n"
 
+     << "  --threads N:整数 0..1024;省略或 0=自动选择线程数。\n\n"
+
      << B << "示例:" << R << "\n"
      << "  " << CY << "zemu-flask" << R << " flask crack --cookie <c> --wordlist rockyou.txt\n"
      << "  " << CY << "zemu-flask" << R << " flask crack --cookie <c> --mask \""
@@ -194,8 +196,30 @@ static int runCommand(int argc, char** argv) {
       else if (a == "--wordlist") wordlist = next();
       else if (a == "--mask") mask = next();
       else if (a == "--threads") {
+        if (i + 1 >= argc || std::string(argv[i + 1]).starts_with("--")) {
+          std::cerr << "[!] --threads 缺少数值(0=自动,范围 0..1024)" << std::endl;
+          return 2;
+        }
         std::string v = next();
-        std::from_chars(v.data(), v.data() + v.size(), threads); // 非法输入保持 0=自动
+        if (v.empty()) {
+          std::cerr << "[!] --threads 缺少数值(0=自动,范围 0..1024)" << std::endl;
+          return 2;
+        }
+        int parsed = 0;
+        auto result = std::from_chars(v.data(), v.data() + v.size(), parsed);
+        if (result.ec == std::errc::result_out_of_range) {
+          std::cerr << "[!] --threads 超出范围,须为 0..1024(0=自动)" << std::endl;
+          return 2;
+        }
+        if (result.ec != std::errc{} || result.ptr != v.data() + v.size()) {
+          std::cerr << "[!] --threads 须为完整整数,范围 0..1024(0=自动)" << std::endl;
+          return 2;
+        }
+        if (parsed < 0 || parsed > 1024) {
+          std::cerr << "[!] --threads 超出范围,须为 0..1024(0=自动)" << std::endl;
+          return 2;
+        }
+        threads = parsed;
       }
       else if (a == "--engine") engine = next();
       else if (a == "--legacy") legacy = true;
@@ -325,7 +349,7 @@ static int cmdInteractive() {
       if (!salt.empty()) { args.push_back("--salt"); args.push_back(salt); }
       std::string engine = ask("engine [auto/gpu/cpu](留空=auto): ", eof);
       if (!engine.empty()) { args.push_back("--engine"); args.push_back(engine); }
-      std::string threads = ask("threads(留空=自动): ", eof);
+      std::string threads = ask("threads(0..1024,留空或 0=自动): ", eof);
       if (!threads.empty()) { args.push_back("--threads"); args.push_back(threads); }
     } else {
       std::cerr << "[!] 无效选择,请重新输入" << std::endl;

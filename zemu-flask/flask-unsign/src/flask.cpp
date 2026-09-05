@@ -2,6 +2,7 @@
 
 #include "b64.h"
 #include "crack_cpu.h"
+#include "thread_group.h"
 #include "gpu/nvrtc.h"
 #include "gpu/ocl.h"
 #include "json_mini.h"
@@ -28,11 +29,14 @@ struct CookieParts {
   std::string payload, ts, sig;
 };
 
-/** cookie 结构切分:payload.ts.sig('.' 不在 b64url 字母表内,必为 3 段) */
+/** cookie 结构切分:[.]payload.ts.sig;压缩标记必须保留在参与签名的 payload 中。 */
 static std::optional<CookieParts> splitCookie(const std::string& cookie) {
-  size_t p1 = cookie.find('.');
-  size_t p2 = cookie.rfind('.');
-  if (p1 == std::string::npos || p1 == p2) return std::nullopt;
+  const size_t payloadStart = !cookie.empty() && cookie[0] == '.' ? 1 : 0;
+  size_t p1 = cookie.find('.', payloadStart);
+  if (p1 == std::string::npos || p1 == payloadStart) return std::nullopt;
+  size_t p2 = cookie.find('.', p1 + 1);
+  if (p2 == std::string::npos || cookie.find('.', p2 + 1) != std::string::npos)
+    return std::nullopt;
   CookieParts c{ cookie.substr(0, p1), cookie.substr(p1 + 1, p2 - p1 - 1), cookie.substr(p2 + 1) };
   if (c.payload.empty() || c.ts.empty() || c.sig.empty()) return std::nullopt;
   return c;
@@ -616,7 +620,7 @@ static uint64_t gpuDictThreshold() {
   return gpuWarm() ? 1500000 : 8000000;
 }
 
-int flaskCrack(const std::string& cookie, const std::string& wordlist, const std::string& mask,
+static int flaskCrackImpl(const std::string& cookie, const std::string& wordlist, const std::string& mask,
                const std::string& saltIn, int threads, const std::string& engine) {
   std::string salt = saltIn.empty() ? DEFAULT_SALT : saltIn;
   auto parts = splitCookie(cookie);
@@ -685,12 +689,17 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
       HybridCtl ctl;
       ctl.tail.store(total);
       CrackResult cpuRes;
-      std::thread cpuT([&] { cpuRes = crackCpuMaskRange(pos, threads, verify, &ctx, ctl, vb, bsz); });
+      ThreadGroup cpuT(ctl.stop);
+      cpuT.launch([&] { cpuRes = crackCpuMaskRange(pos, threads, verify, &ctx, ctl, vb, bsz); });
       uint64_t idx = 0, gpuAtt = 0;
       std::string err;
       auto t0 = std::chrono::steady_clock::now();
       int rc = gpuCrackMask(gp, pos, total, idx, err, &ctl, &gpuAtt);
-      cpuT.join();
+      cpuT.finish();
+      if (!cpuRes.error.empty()) {
+        std::cerr << "[!] " << cpuRes.error << std::endl;
+        return 1;
+      }
       auto t1 = std::chrono::steady_clock::now();
       double secs = std::chrono::duration<double>(t1 - t0).count();
       if (g_crackAbort.load(std::memory_order_relaxed)) {
@@ -851,19 +860,20 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
     // 两遍并行打包:Pass 1 各线程计数可打包/超长;Pass 2 按前缀偏移并行写 idxMap/skippedIdx 与字节。
     std::vector<size_t> pCnt((size_t)nt, 0), sCnt((size_t)nt, 0);
     {
-      std::vector<std::thread> th;
-      th.reserve((size_t)nt);
+      ThreadGroup th;
       for (int t = 0; t < nt; t++) {
         size_t lo = nw * (size_t)t / (size_t)nt, hi = nw * (size_t)(t + 1) / (size_t)nt;
-        th.emplace_back([&, t, lo, hi] {
+        th.launch([&, t, lo, hi] {
           size_t pc = 0;
-          for (size_t i = lo; i < hi; i++)
+          for (size_t i = lo; i < hi; i++) {
+            if ((i & 1023) == 0 && th.stopped()) return;
             if (words[i].size() <= STRIDE && words[i].find('\0') == std::string::npos) pc++;
+          }
           pCnt[(size_t)t] = pc;
           sCnt[(size_t)t] = hi - lo - pc;
         });
       }
-      for (auto& x : th) x.join();
+      th.finish();
     }
     std::vector<size_t> pBase((size_t)nt, 0), sBase((size_t)nt, 0);
     size_t packedCount = 0, skippedCount = 0;
@@ -880,6 +890,12 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
     const size_t totalBytes = packedCount * STRIDE;
     OclHostBuf oclPin;
     CudaHostBuf cudaPin;
+    // Backend frees clear their handles, so this also covers pre-handoff failures.
+    struct HostGuard {
+      OclHostBuf& ocl;
+      CudaHostBuf& cuda;
+      ~HostGuard() { oclHostFree(ocl); cudaHostFree(cuda); }
+    } hostGuard{oclPin, cudaPin};
     std::vector<uint8_t> fallback;
     uint8_t* buf = nullptr;
     bool cudaBuf = false, oclBuf = false;
@@ -899,14 +915,14 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
 
     // Pass 2:并行写(idxMap/skippedIdx 与 packed 字节;末尾短于 stride 的部分显式零填充)
     if (totalBytes > 0) {
-      std::vector<std::thread> th;
-      th.reserve((size_t)nt);
+      ThreadGroup th;
       for (int t = 0; t < nt; t++) {
         size_t lo = nw * (size_t)t / (size_t)nt, hi = nw * (size_t)(t + 1) / (size_t)nt;
-        th.emplace_back([&, t, lo, hi] {
+        th.launch([&, t, lo, hi] {
           size_t pi = pBase[(size_t)t];
           size_t si = sBase[(size_t)t];
           for (size_t i = lo; i < hi; i++) {
+            if ((i & 1023) == 0 && th.stopped()) return;
             size_t n = words[i].size();
             if (n > STRIDE || words[i].find('\0') != std::string::npos) {
               skippedIdx[si++] = i;
@@ -920,7 +936,7 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
           }
         });
       }
-      for (auto& x : th) x.join();
+      th.finish();
     }
     if (std::getenv("ZK_PROF")) {
       double ms = std::chrono::duration<double, std::milli>(PClk::now() - tp0).count();
@@ -936,13 +952,18 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
         HybridCtl ctl;
         ctl.tail.store(words.size());
         CrackResult cpuRes;
-        std::thread cpuT([&] { cpuRes = crackCpuWordsRange(words, threads, verify, &ctx, ctl, vb, bsz); });
+        ThreadGroup cpuT(ctl.stop);
+        cpuT.launch([&] { cpuRes = crackCpuWordsRange(words, threads, verify, &ctx, ctl, vb, bsz); });
         uint64_t idx = 0, gpuAtt = 0;
         std::string err;
         auto t0 = std::chrono::steady_clock::now();
         int rc = gpuCrackDict(gp, buf, STRIDE, idxMap.size(), idx, err, &ctl, &idxMap, &gpuAtt,
                               oclBuf ? &oclPin : nullptr);
-        cpuT.join();
+        cpuT.finish();
+        if (!cpuRes.error.empty()) {
+          std::cerr << "[!] " << cpuRes.error << std::endl;
+          return 1;
+        }
         auto t1 = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(t1 - t0).count();
         if (g_crackAbort.load(std::memory_order_relaxed)) {
@@ -1039,5 +1060,18 @@ int flaskCrack(const std::string& cookie, const std::string& wordlist, const std
     return 0;
   }
   std::cerr << "[!] 字典跑完未命中" << std::endl;
+  return 1;
+}
+
+// All task-owned threads have stopped and joined before exceptions reach here.
+int flaskCrack(const std::string& cookie, const std::string& wordlist, const std::string& mask,
+               const std::string& salt, int threads, const std::string& engine) {
+  try {
+    return flaskCrackImpl(cookie, wordlist, mask, salt, threads, engine);
+  } catch (const std::exception& e) {
+    std::cerr << "[!] 搜索任务失败: " << e.what() << std::endl;
+  } catch (...) {
+    std::cerr << "[!] 搜索任务失败: 未知异常" << std::endl;
+  }
   return 1;
 }

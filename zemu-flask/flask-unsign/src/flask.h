@@ -6,7 +6,8 @@
  *   derived = HMAC-SHA1(key=secret, msg=salt)      // key_derivation='hmac'
  *   hmac    = HMAC-SHA1(key=derived, msg=b64url(json)"."b64url(ts))
  *   salt    = 'cookie-session'(Flask 固定)
- * 压缩格式('.' 开头 + zlib)是老 itsdangerous(<0.18)遗留,仅 decode 支持。
+ * 压缩格式的 payload 为 '.' + b64url(zlib(json)),前导点也参与签名。
+ * decode / verify / crack 支持压缩格式;sign 当前输出未压缩格式。
  */
 #pragma once
 

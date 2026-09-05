@@ -1,4 +1,5 @@
 #include "crack_cpu.h"
+#include "thread_group.h"
 
 #include <atomic>
 #include <chrono>
@@ -90,19 +91,26 @@ struct ProgressInl {
 struct RunCtx {
   std::atomic<uint64_t> attempts{0};
   std::atomic<bool> found{false};
+  std::atomic<bool> stop{false};
   std::string secret;
 };
 
 /** 线程池骨架:计时 + 汇总 */
 template <typename Worker>
-static CrackResult runPool(int threads, uint64_t total, RunCtx& rc, ProgressInl& prog, Worker worker) {
+static CrackResult runPool(int threads, uint64_t total, RunCtx& rc, ProgressInl& prog, Worker worker,
+                           std::atomic<bool>* peerStop = nullptr) {
   CrackResult res;
   auto t0 = std::chrono::steady_clock::now();
   int n = threads > 0 ? threads : (int)std::thread::hardware_concurrency();
   if (n < 1) n = 1;
-  std::vector<std::thread> pool;
-  for (int i = 0; i < n; i++) pool.emplace_back(worker);
-  for (auto& t : pool) t.join();
+  try {
+    ThreadGroup pool(rc.stop, peerStop);
+    for (int i = 0; i < n && !pool.stopped(); i++) pool.launch(worker);
+    pool.finish();
+  } catch (const std::exception& e) {
+    res.error = e.what();
+    return res;
+  }
   res.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   res.attempts = rc.attempts.load();
   res.found = rc.found.load();
@@ -159,6 +167,7 @@ CrackResult crackCpuWords(const std::vector<std::string>& words, int threads,
     std::vector<const uint8_t*> bkeys((size_t)B); // 批量槽:直接指进 words
     std::vector<size_t> bklen((size_t)B);
     while (!rc.found.load(std::memory_order_relaxed) &&
+           !rc.stop.load(std::memory_order_relaxed) &&
            !g_crackAbort.load(std::memory_order_relaxed)) {
       // 每线程每次领 1024 个,减少原子争抢
       size_t begin = idx.fetch_add(1024, std::memory_order_relaxed);
@@ -244,6 +253,7 @@ CrackResult crackCpuMaskRange(const std::vector<std::string>& pos, int threads,
     std::vector<size_t> bklen((size_t)B);
     while (!ctl.stop.load(std::memory_order_relaxed) &&
            !rc.found.load(std::memory_order_relaxed) &&
+           !rc.stop.load(std::memory_order_relaxed) &&
            !g_crackAbort.load(std::memory_order_relaxed)) {
       uint64_t start = 0, end = 0;
       if (!claimHybridTail(ctl, start, end)) break;
@@ -302,7 +312,7 @@ CrackResult crackCpuMaskRange(const std::vector<std::string>& pos, int threads,
       local = 0;
     }
     rc.attempts.fetch_add(local, std::memory_order_relaxed);
-  });
+  }, &ctl.stop);
   return res;
 }
 
@@ -320,6 +330,7 @@ CrackResult crackCpuWordsRange(const std::vector<std::string>& words, int thread
     std::vector<size_t> bklen((size_t)B);
     while (!ctl.stop.load(std::memory_order_relaxed) &&
            !rc.found.load(std::memory_order_relaxed) &&
+           !rc.stop.load(std::memory_order_relaxed) &&
            !g_crackAbort.load(std::memory_order_relaxed)) {
       uint64_t start = 0, end = 0;
       if (!claimHybridTail(ctl, start, end)) break;
@@ -364,7 +375,7 @@ CrackResult crackCpuWordsRange(const std::vector<std::string>& words, int thread
       local = 0;
     }
     rc.attempts.fetch_add(local, std::memory_order_relaxed);
-  });
+  }, &ctl.stop);
 }
 
 CrackResult crackCpuMask(const std::vector<std::string>& pos, int threads,
@@ -397,6 +408,7 @@ CrackResult crackCpuMask(const std::vector<std::string>& pos, int threads,
     std::vector<size_t> bklen((size_t)B);
 
     while (!rc.found.load(std::memory_order_relaxed) &&
+           !rc.stop.load(std::memory_order_relaxed) &&
            !g_crackAbort.load(std::memory_order_relaxed)) {
       uint64_t start = base.fetch_add(CHUNK, std::memory_order_relaxed);
       if (start >= total) break;

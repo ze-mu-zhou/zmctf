@@ -11,8 +11,9 @@
  * - key 块 / ipad / opad / 外层尾块全部按 16 字在寄存器构造(key < 64B 由调用方
  *   保证),无 k[64]/pad[64]/ob[64] 逐字节循环,不触发 local memory;
  * - 每个 work item 处理 1 个候选,拉满占用率;命中写 found(候选序号)。
- * 实测备注(勿重复尝试):SHA1 16 轮一组部分展开(~356M/s)与
- * reqd_work_group_size 限块(驱动忽略)均更差/无效,已回退。
+ * 实测备注(勿重复尝试):SHA1 16 轮一组部分展开(~356M/s)、
+ * reqd_work_group_size 限块(驱动忽略)、tail 块消息调度主机端预算+免展开压缩
+ * (常量带宽瓶颈,~44M/s,慢 16 倍,已回退)均更差/无效。
  */
 #pragma once
 
@@ -245,7 +246,6 @@ inline void sha1_block_c(uint* h, ZK_CPTR(uint) p) {
   for (int i = 0; i < 16; i++) w[i] = p[i];
   sha1_block_w(h, w);
 }
-
 inline void sha1_iv(uint* h) {
   h[0] = 0x67452301U; h[1] = 0xEFCDAB89U; h[2] = 0x98BADCFEU;
   h[3] = 0x10325476U; h[4] = 0xC3D2E1F0U;
@@ -284,6 +284,34 @@ inline void hmac_pre_b(const uchar* key, uint klen,
     }
     w[i] = kb ^ 0x5C5C5C5CU;
   }
+  sha1_iv(h);
+  sha1_block_w(h, w);
+  uint ew[16];
+  ew[0] = hi0; ew[1] = hi1; ew[2] = hi2; ew[3] = hi3; ew[4] = hi4;
+  ew[5] = 0x80000000U;
+  for (int i = 6; i < 15; i++) ew[i] = 0;
+  ew[15] = 0x000002A0U;
+  sha1_block_w(h, ew);
+  out[0] = h[0]; out[1] = h[1]; out[2] = h[2]; out[3] = h[3]; out[4] = h[4];
+}
+
+/**
+ * HMAC-SHA1 预计算路径(key 已打包成大端字块 kw[16],仅掩码模式用)。
+ * kw 由 crack_mask 里按 npos 特化的 switch 打包:字面量 N 让 bi<N 谓词在
+ * 循环展开后全部编译期折叠,等效 #define ZK_KLEN 注入但程序仍只 JIT 一次;
+ * 且 ipad/opad 两遍复用 kw,消掉 hmac_pre_b 的重复 gather。
+ * kw 中 bi≥N 的词是字面量 0(不占寄存器),活跃寄存器 ≤ ceil(npos/4) ≤ 6。
+ */
+inline void hmac_pre_kw(const uint kw[16],
+                        ZK_CPTR(uint) tail, uint tailBlocks, uint out[5]) {
+  uint w[16];
+  for (int i = 0; i < 16; i++) w[i] = kw[i] ^ 0x36363636U;
+  uint h[5];
+  sha1_iv(h);
+  sha1_block_w(h, w);
+  for (uint b = 0; b < tailBlocks; b++) sha1_block_c(h, tail + b * 16);
+  uint hi0 = h[0], hi1 = h[1], hi2 = h[2], hi3 = h[3], hi4 = h[4];
+  for (int i = 0; i < 16; i++) w[i] = kw[i] ^ 0x5C5C5C5CU;
   sha1_iv(h);
   sha1_block_w(h, w);
   uint ew[16];
@@ -359,8 +387,50 @@ ZK_KERNEL void crack_mask(
     cand[k] = csbuf[csoff[k] + (uint)(x - q * cslen[k])];
     x = q;
   }
+  // key 打包:npos 逐任务固定但程序只 JIT 一次,无法 #define 注入——改用
+  // switch + 宏展开生成 24 份字面量 N 的打包代码,循环全展开后谓词编译期折叠;
+  // 打包一次进 kw(N≥bi 的词为常量 0),ipad/opad 两遍复用。默认分支防御运行时值。
+  uint kw[16];
+#define ZK_GATHER_N(N) \
+    { for (int i = 0; i < 16; i++) { \
+        uint kb = 0, bi = (uint)i * 4; \
+        if (bi < (N)) { \
+          kb = (uint)cand[bi] << 24; \
+          if (bi + 1 < (N)) kb |= (uint)cand[bi + 1] << 16; \
+          if (bi + 2 < (N)) kb |= (uint)cand[bi + 2] << 8; \
+          if (bi + 3 < (N)) kb |= (uint)cand[bi + 3]; \
+        } \
+        kw[i] = kb; } }
+  switch (npos) {
+    case 1: ZK_GATHER_N(1); break;
+    case 2: ZK_GATHER_N(2); break;
+    case 3: ZK_GATHER_N(3); break;
+    case 4: ZK_GATHER_N(4); break;
+    case 5: ZK_GATHER_N(5); break;
+    case 6: ZK_GATHER_N(6); break;
+    case 7: ZK_GATHER_N(7); break;
+    case 8: ZK_GATHER_N(8); break;
+    case 9: ZK_GATHER_N(9); break;
+    case 10: ZK_GATHER_N(10); break;
+    case 11: ZK_GATHER_N(11); break;
+    case 12: ZK_GATHER_N(12); break;
+    case 13: ZK_GATHER_N(13); break;
+    case 14: ZK_GATHER_N(14); break;
+    case 15: ZK_GATHER_N(15); break;
+    case 16: ZK_GATHER_N(16); break;
+    case 17: ZK_GATHER_N(17); break;
+    case 18: ZK_GATHER_N(18); break;
+    case 19: ZK_GATHER_N(19); break;
+    case 20: ZK_GATHER_N(20); break;
+    case 21: ZK_GATHER_N(21); break;
+    case 22: ZK_GATHER_N(22); break;
+    case 23: ZK_GATHER_N(23); break;
+    case 24: ZK_GATHER_N(24); break;
+    default: ZK_GATHER_N(npos); break;
+  }
+#undef ZK_GATHER_N
   uint dkw[5], macw[5];
-  hmac_pre_b(cand, npos, salt_tail, salt_blocks, dkw);
+  hmac_pre_kw(kw, salt_tail, salt_blocks, dkw);
   hmac_pre_w(dkw, value_tail, value_blocks, macw);
   if (eq20w(macw, e0, e1, e2, e3, e4)) *found = (i64)idx;
 }
