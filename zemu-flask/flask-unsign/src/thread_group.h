@@ -15,6 +15,13 @@
 
 // Own every started thread until it is joined. Stop flags are task-local;
 // failures must not set the persistent g_crackAbort flag used by serve.
+// Default construction owns its stop flag: stopping means a recorded failure
+// (finish() joins then throws), or destruction during unwinding (the caller
+// abandons partial output). Packing workers may therefore return without
+// completing output when stopped; consumers must run only after finish().
+// With an external stop flag, normal cancellation or a peer's successful hit
+// may also stop workers. stopped() does NOT generally imply finish() throws.
+// finish() propagates only exceptions recorded by this group.
 class ThreadGroup {
   std::atomic<bool> ownStop_{false};
   std::atomic<bool>& stop_;

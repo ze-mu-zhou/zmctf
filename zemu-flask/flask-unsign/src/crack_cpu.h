@@ -25,7 +25,7 @@ std::string maskCandidate(uint64_t idx, const std::vector<std::string>& pos);
 struct CrackResult {
   bool found = false;
   std::string secret;      // 命中时的密钥
-  uint64_t attempts = 0;   // 实际尝试数
+  uint64_t attempts = 0;   // 已汇总尝试数;异常时可能缺少线程局部批次,为下界
   double seconds = 0;      // 耗时
   std::string error;       // 参数/IO 错误(found=false 且 error 非空)
 };

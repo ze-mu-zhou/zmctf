@@ -282,7 +282,7 @@ static OclCtx& ocl() {
   // ---- 编译产物缓存:NVIDIA 从源码 JIT 要 0.1~2s,落盘后启动 <10ms ----
   // 文件格式:[u32 magic][u32 devNameLen][devName][u32 tunedLws][binary]
   // magic 含版本号,kernel 签名/缓存格式变更即 bump,旧缓存自动失效重建
-  const uint32_t CACHE_MAGIC = 0x5A4B4E14; // "ZKN" v20(v19 免展开压缩实测慢 16x 已回退;v18 掩码 key 打包特化)
+  const uint32_t CACHE_MAGIC = 0x5A4B4E14; // "ZKN" v20:回退 v19 免展开压缩实验,保留 v18 掩码 key 打包特化;递增版本以使实验缓存失效
   char exePath[MAX_PATH] = {0};
   GetModuleFileNameA(nullptr, exePath, MAX_PATH);
   std::string cachePath = exePath;

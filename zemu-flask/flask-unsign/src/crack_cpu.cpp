@@ -109,10 +109,12 @@ static CrackResult runPool(int threads, uint64_t total, RunCtx& rc, ProgressInl&
     pool.finish();
   } catch (const std::exception& e) {
     res.error = e.what();
-    return res;
   }
   res.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  // On failure this is the published count, a lower bound: a throwing worker
+  // may still have an unflushed local batch. Never expose partial success.
   res.attempts = rc.attempts.load();
+  if (!res.error.empty()) return res;
   res.found = rc.found.load();
   res.secret = rc.secret;
   return res;

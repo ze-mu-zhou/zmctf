@@ -221,7 +221,7 @@ static CudaCtx& cuda() {
 
   // ---- cubin 缓存:NVRTC 全量编译要秒级,落盘后启动 <10ms ----
   // 文件格式:[u32 magic][u32 keyLen][key(devName|arch)][cubin]
-  const uint32_t CACHE_MAGIC = 0x5A4B4305; // "ZKC" v5(v4 免展开压缩实测慢 16x 已回退;v3 掩码 key 打包特化)
+  const uint32_t CACHE_MAGIC = 0x5A4B4305; // "ZKC" v5:回退 v4 免展开压缩实验,保留 v3 掩码 key 打包特化;递增版本以使实验缓存失效
   std::string key = c.deviceName + "|" + arch;
   std::string cachePath;
 #ifdef _WIN32

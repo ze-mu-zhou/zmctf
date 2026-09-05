@@ -141,7 +141,17 @@ check("T10-threads-serve-recovery", r.returncode == 0 and
       sentinels == ["<<<zk-rc=2>>>", "<<<zk-rc=0>>>"] and "dragon" in r.stdout.splitlines())
 
 # 交互模式复用相同解析,错误返回菜单并能正常退出。
-answers = "\n".join(["4", c, "2", "dragon", "", "cpu", "8abc", "0", ""])
+answers = "\n".join([
+    "4",       # 主菜单:密钥搜索
+    c,         # cookie
+    "2",       # 搜索方式:掩码
+    "dragon",  # 掩码
+    "",        # 默认 salt
+    "cpu",     # 引擎
+    "8abc",    # 非法线程数:应报错并返回菜单
+    "0",       # 主菜单:退出
+    "",        # 最后一行换行
+])
 r = subprocess.run([TOOL, "interactive"], input=answers, capture_output=True,
                    text=True, encoding="utf-8", timeout=15)
 check("T10-threads-interactive-reject", r.returncode == 0 and

@@ -6,6 +6,11 @@ static void require(bool ok, const char* message) {
   if (!ok) throw std::runtime_error(message);
 }
 static bool throwsUnknown(const uint8_t*, size_t, void*) { throw 42; }
+static bool failsAfterBatch(const uint8_t*, size_t, void* ctx) {
+  auto& calls = *static_cast<unsigned*>(ctx);
+  if (++calls == 1100) throw std::runtime_error("failure after published batch");
+  return false;
+}
 static bool matches(const uint8_t*, size_t, void*) { return true; }
 
 int main() {
@@ -30,6 +35,13 @@ int main() {
   require(!g_crackAbort.load(), "failure leaked into persistent cancellation state");
   auto recovered = crackCpuWords(words, 2, matches, nullptr);
   require(recovered.found && recovered.error.empty(), "next CPU task did not recover");
+
+  unsigned calls = 0;
+  failed = crackCpuWords(words, 1, failsAfterBatch, &calls);
+  require(!failed.error.empty() && !failed.found && failed.secret.empty(),
+          "failed task exposed partial success");
+  require(failed.seconds > 0 && failed.attempts >= 1024 && failed.attempts <= calls,
+          "failed task lost published statistics");
 
   HybridCtl ctl;
   ctl.tail.store(words.size());

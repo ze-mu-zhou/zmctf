@@ -1063,6 +1063,8 @@ static int flaskCrackImpl(const std::string& cookie, const std::string& wordlist
   return 1;
 }
 
+// CPU pool failures normally travel through CrackResult.error. The outer
+// coordinator/packing threads and failures outside runPool still throw.
 // All task-owned threads have stopped and joined before exceptions reach here.
 int flaskCrack(const std::string& cookie, const std::string& wordlist, const std::string& mask,
                const std::string& salt, int threads, const std::string& engine) {

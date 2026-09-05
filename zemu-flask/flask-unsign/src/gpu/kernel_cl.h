@@ -246,6 +246,7 @@ inline void sha1_block_c(uint* h, ZK_CPTR(uint) p) {
   for (int i = 0; i < 16; i++) w[i] = p[i];
   sha1_block_w(h, w);
 }
+
 inline void sha1_iv(uint* h) {
   h[0] = 0x67452301U; h[1] = 0xEFCDAB89U; h[2] = 0x98BADCFEU;
   h[3] = 0x10325476U; h[4] = 0xC3D2E1F0U;
